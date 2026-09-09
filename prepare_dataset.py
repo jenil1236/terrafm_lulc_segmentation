@@ -346,16 +346,11 @@ def prepare_all(
         )
 
     # ---- 3. Discover class mapping
-    print("Discovering class IDs from reference maps...")
-    ref_paths = []
-    for row in df.itertuples():
-        for ext in (".tif", ".tiff"):
-            p = Path(ref_root) / f"{row.reference_map_id}{ext}"
-            if p.exists():
-                ref_paths.append(str(p))
-                break
-
-    raw_to_train = discover_class_ids(ref_paths)
+    # Use the canonical BigEarthNet CLC→19-class mapping from visualize.py.
+    # This guarantees the same class IDs are used in training AND visualization.
+    print("Building class mapping from BigEarthNet CLC→19-class scheme...")
+    from visualize import CLC_TO_TRAIN_ID
+    raw_to_train = CLC_TO_TRAIN_ID.copy()
     CFG.raw_to_train = raw_to_train
 
     os.makedirs(out_dir, exist_ok=True)

@@ -133,14 +133,51 @@ class Config:
     num_classes: int = 19
     ignore_index: int = 255
     raw_to_train: Dict[int, int] = field(default_factory=dict)
+
+    # BigEarthNet 19-class names (index 0–18, matching class_to_number order)
     class_names: List[str] = field(default_factory=lambda: [
-        f"class_{i}" for i in range(19)
+        "Urban fabric",                                                   # 0
+        "Industrial or commercial units",                                 # 1
+        "Arable land",                                                    # 2
+        "Permanent crops",                                                # 3
+        "Pastures",                                                       # 4
+        "Complex cultivation patterns",                                   # 5
+        "Land principally occupied by agriculture",                       # 6
+        "Agro-forestry areas",                                            # 7
+        "Broad-leaved forest",                                            # 8
+        "Coniferous forest",                                              # 9
+        "Mixed forest",                                                   # 10
+        "Natural grassland and sparsely vegetated areas",                 # 11
+        "Moors, heathland and sclerophyllous vegetation",                 # 12
+        "Transitional woodland, shrub",                                   # 13
+        "Beaches, dunes, sands",                                          # 14
+        "Inland wetlands",                                                # 15
+        "Coastal wetlands",                                               # 16
+        "Inland waters",                                                  # 17
+        "Marine waters",                                                  # 18
     ])
+
+    # Fixed colors per BigEarthNet class (same order as class_names above)
     class_colors: List[str] = field(default_factory=lambda: [
-        "#1f77b4", "#aec7e8", "#ffbb78", "#ff7f0e", "#2ca02c",
-        "#98df8a", "#d62728", "#ff9896", "#9467bd", "#c5b0d5",
-        "#8c564b", "#c49c94", "#e377c2", "#f7b6d2", "#7f7f7f",
-        "#c7c7c7", "#bcbd22", "#dbdb8d", "#17becf",
+        "#e41a1c",  # 0  Urban fabric
+        "#984ea3",  # 1  Industrial or commercial units
+        "#ffd92f",  # 2  Arable land
+        "#ffad33",  # 3  Permanent crops
+        "#78c679",  # 4  Pastures
+        "#a6d854",  # 5  Complex cultivation patterns
+        "#fdae61",  # 6  Land principally occupied by agriculture
+        "#66c2a5",  # 7  Agro-forestry areas
+        "#006d2c",  # 8  Broad-leaved forest
+        "#238b45",  # 9  Coniferous forest
+        "#31a354",  # 10 Mixed forest
+        "#8c96c6",  # 11 Natural grassland
+        "#9e9ac8",  # 12 Moors, heathland
+        "#8856a7",  # 13 Transitional woodland, shrub
+        "#fdd49e",  # 14 Beaches, dunes, sands
+        "#74c476",  # 15 Inland wetlands
+        "#41ae76",  # 16 Coastal wetlands
+        "#2171b5",  # 17 Inland waters
+        "#6baed6",  # 18 Marine waters
     ])
     class_mapping_file: str = "/content/outputs/class_mapping.json"
 
