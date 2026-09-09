@@ -1,39 +1,38 @@
 """
 visualize.py
 ============
-Visualization utilities for LULC segmentation results.
+Visualization utilities for BigEarthNet 19-class LULC segmentation.
 
-What this file does:
-    - Plot S2 RGB composite + ground truth + prediction + error map
-    - Plot confusion matrix heatmap
-    - Plot training/validation loss and mIoU curves
+Uses fixed BigEarthNet class names and colors (matching the reference
+diagnostic script) so every visualization is consistent.
 
-Uses fixed BigEarthNet 19-class colors matching the reference code,
-so every visualization is consistent across the entire project.
+Key design:
+  - GT and prediction masks are colorized via a uint8 lookup table,
+    NOT via matplotlib colormaps with vmin/vmax (avoids the -1 clipping bug).
+  - ignore_index=255 pixels render as dark grey, not black, so they are
+    visually distinct from dark-colored classes like water.
+  - Legend shows only the classes actually present in the patch.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
 import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# BigEarthNet CLC → 19-class mapping
-# Mirrors the reference code exactly so raw TIFF values are always
-# converted the same way regardless of which module calls the mapping.
+# BigEarthNet CLC → 19-class canonical mapping
 # ---------------------------------------------------------------------------
 
-# Raw CLC ID → BigEarthNet class name
-CLC_TO_CLASS_NAME: dict = {
+# Raw CLC ID → class name (matches reference script exactly)
+CLC_TO_CLASS_NAME: Dict[int, str] = {
     111: "Urban fabric",
     112: "Urban fabric",
     121: "Industrial or commercial units",
@@ -68,7 +67,7 @@ CLC_TO_CLASS_NAME: dict = {
     523: "Marine waters",
 }
 
-# BigEarthNet 19-class names in canonical order (index = train ID)
+# Canonical 19-class list — index = train ID (0-indexed)
 BIGEARTHNET_CLASS_NAMES: List[str] = [
     "Urban fabric",                                           # 0
     "Industrial or commercial units",                         # 1
@@ -91,17 +90,7 @@ BIGEARTHNET_CLASS_NAMES: List[str] = [
     "Marine waters",                                          # 18
 ]
 
-# Train ID → class name lookup
-TRAIN_ID_TO_NAME: dict = {i: n for i, n in enumerate(BIGEARTHNET_CLASS_NAMES)}
-
-# CLC raw ID → train ID (built from above two dicts)
-CLC_TO_TRAIN_ID: dict = {
-    raw: BIGEARTHNET_CLASS_NAMES.index(name)
-    for raw, name in CLC_TO_CLASS_NAME.items()
-    if name in BIGEARTHNET_CLASS_NAMES
-}
-
-# Fixed colors per class (index matches BIGEARTHNET_CLASS_NAMES)
+# Fixed colors per class — same hex values as reference script
 BIGEARTHNET_COLORS: List[str] = [
     "#e41a1c",  # 0  Urban fabric
     "#984ea3",  # 1  Industrial or commercial units
@@ -124,48 +113,55 @@ BIGEARTHNET_COLORS: List[str] = [
     "#6baed6",  # 18 Marine waters
 ]
 
+# CLC raw ID → train ID  (derived from the two dicts above)
+CLC_TO_TRAIN_ID: Dict[int, int] = {
+    raw: BIGEARTHNET_CLASS_NAMES.index(name)
+    for raw, name in CLC_TO_CLASS_NAME.items()
+    if name in BIGEARTHNET_CLASS_NAMES
+}
+
 
 # ---------------------------------------------------------------------------
 # Color utilities
 # ---------------------------------------------------------------------------
 
 def hex_to_rgb(hex_color: str) -> tuple:
-    """Convert '#rrggbb' → (R, G, B) floats in [0, 1]."""
+    """'#rrggbb' → (R, G, B) floats in [0, 1]."""
     h = hex_color.lstrip("#")
-    return tuple(int(h[i:i+2], 16) / 255.0 for i in (0, 2, 4))
+    return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
 
 
 def build_color_map(
     class_colors: List[str],
     ignore_index: int = 255,
-    ignore_color: tuple = (20, 20, 20),   # very dark grey for ignored pixels
+    ignore_color: tuple = (30, 30, 30),   # dark grey for ignored pixels
 ) -> np.ndarray:
     """
-    Build a [256, 3] uint8 lookup table mapping train IDs → RGB.
+    Build a [256, 3] uint8 lookup table: train_id → RGB.
 
-    Index 0..N-1  → class colors
-    ignore_index  → dark grey (distinguishable from pure black water/shadow)
+    Indices 0..N-1 → class colors.
+    ignore_index   → dark grey (distinguishable from dark classes like water).
     """
     cmap = np.zeros((256, 3), dtype=np.uint8)
     for i, hex_c in enumerate(class_colors):
         r, g, b = hex_to_rgb(hex_c)
         cmap[i] = [int(r * 255), int(g * 255), int(b * 255)]
-    cmap[ignore_index % 256] = ignore_color
+    cmap[ignore_index % 256] = list(ignore_color)
     return cmap
 
 
 def mask_to_rgb(mask: np.ndarray, color_map: np.ndarray) -> np.ndarray:
-    """Integer mask [H, W] → RGB image [H, W, 3] via color_map lookup."""
+    """
+    Integer mask [H, W] → RGB image [H, W, 3] via direct lookup.
+
+    Uses the color_map array as a lookup table — no matplotlib normalization,
+    so there is no risk of -1 or out-of-range values corrupting the colors.
+    """
     return color_map[np.clip(mask.astype(np.int32), 0, 255)]
 
 
-def build_listed_cmap(class_colors: List[str]) -> ListedColormap:
-    """Build a matplotlib ListedColormap for imshow/colorbar use."""
-    return ListedColormap(class_colors)
-
-
 # ---------------------------------------------------------------------------
-# S2 band → display RGB
+# S2 → display RGB
 # ---------------------------------------------------------------------------
 
 def s2_to_rgb(
@@ -174,28 +170,28 @@ def s2_to_rgb(
     norm_std: Optional[List] = None,
 ) -> np.ndarray:
     """
-    Convert normalized S2 tensor [12, H, W] → display RGB [H, W, 3].
+    Normalized S2 tensor [12, H, W] → display RGB [H, W, 3] float32.
 
     Uses B04 (index 3) = red, B03 (index 2) = green, B02 (index 1) = blue.
-    Denormalizes if mean/std provided, stretches reflectance to [0, 1]
-    and applies sqrt gamma so dark areas remain visible.
+    Denormalizes if mean/std provided. Stretches to typical reflectance
+    range [0, 0.3] and applies sqrt gamma for visibility.
     """
     arr = s2.cpu().numpy().astype(np.float32)  # [12, H, W]
 
     if norm_mean is not None and norm_std is not None:
         mean = np.array(norm_mean, dtype=np.float32).reshape(-1, 1, 1)
         std  = np.array(norm_std,  dtype=np.float32).reshape(-1, 1, 1)
-        arr  = arr * std + mean  # back to reflectance
+        arr  = arr * std + mean   # undo z-normalization → reflectance
 
-    # B04=idx3 (R), B03=idx2 (G), B02=idx1 (B)
+    # Natural colour: R=B04, G=B03, B=B02
     rgb = np.stack([arr[3], arr[2], arr[1]], axis=-1)  # [H, W, 3]
-    rgb = np.clip(rgb, 0.0, 0.3) / 0.3                # stretch to visible range
+    rgb = np.clip(rgb, 0.0, 0.3) / 0.3                # stretch to [0,1]
     rgb = np.power(np.clip(rgb, 0, 1), 0.5)            # sqrt gamma
     return rgb.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
-# Qualitative sample plot  (4-panel)
+# 4-panel qualitative sample plot
 # ---------------------------------------------------------------------------
 
 def plot_qualitative_sample(
@@ -210,75 +206,57 @@ def plot_qualitative_sample(
     norm_std: Optional[List] = None,
 ) -> None:
     """
-    Save a 4-panel PNG:
-        Panel 1 – S2 natural-color composite
-        Panel 2 – Ground truth (colorized by class)
-        Panel 3 – Model prediction (same colorization)
-        Panel 4 – Error map  (white=correct, red=wrong, dark grey=ignored)
+    Save a 4-panel PNG per patch:
+        Panel 1 – S2 natural-colour composite
+        Panel 2 – Ground truth  (class colors; ignored pixels = dark grey)
+        Panel 3 – Prediction    (same colorization)
+        Panel 4 – Error map     (white=correct, red=wrong, dark grey=ignored)
 
-    Ground truth and prediction use a matplotlib ListedColormap so colors
-    match the reference code exactly. The legend shows only classes that
-    actually appear in this patch (not all 19) to keep it readable.
+    Colorization uses direct uint8 lookup — NOT matplotlib imshow with
+    vmin/vmax, which would silently clip out-of-range values to the first
+    or last color and corrupt the display.
 
     Args:
-        s2:           [12, H, W] float32 S2 tensor (normalized).
-        gt_mask:      [H, W] int64 ground-truth tensor (train IDs or ignore).
-        pred_mask:    [H, W] int64 prediction tensor.
+        s2:           [12, H, W] normalized S2 tensor.
+        gt_mask:      [H, W] int64 tensor with train IDs (0–18) or ignore_index.
+        pred_mask:    [H, W] int64 tensor with model predictions.
         class_names:  19 class name strings.
         class_colors: 19 hex color strings (same index order as class_names).
-        ignore_index: Value to treat as "no data" (default 255).
-        save_path:    Where to write the PNG.
+        ignore_index: Pixels with this value are shown as dark grey.
+        save_path:    Output PNG path. If None the figure is shown interactively.
         norm_mean/std: S2 normalization stats for denormalization.
     """
-    # Build color assets
-    cmap_list  = build_listed_cmap(class_colors)          # for imshow
-    color_map  = build_color_map(class_colors, ignore_index)
+    color_map = build_color_map(class_colors, ignore_index)
 
-    rgb      = s2_to_rgb(s2, norm_mean, norm_std)
+    rgb      = s2_to_rgb(s2, norm_mean, norm_std)         # [H,W,3] float32
     gt_np    = gt_mask.numpy().astype(np.int32)
     pred_np  = pred_mask.numpy().astype(np.int32)
 
-    # Replace ignore pixels with NaN-equivalent for imshow (show as grey)
-    def _to_display(arr):
-        """Return float array with ignore pixels set to -1 (outside cmap range)."""
-        out = arr.astype(np.float32)
-        out[arr == ignore_index] = -1
-        return out
-
-    gt_display   = _to_display(gt_np)
-    pred_display = _to_display(pred_np)
+    # Direct lookup — correct colors guaranteed regardless of value range
+    gt_rgb   = mask_to_rgb(gt_np,   color_map)            # [H,W,3] uint8
+    pred_rgb = mask_to_rgb(pred_np, color_map)            # [H,W,3] uint8
 
     # Error map
     valid   = gt_np != ignore_index
     correct = (gt_np == pred_np) & valid
-    error   = np.zeros((*gt_np.shape, 3), dtype=np.uint8)
+    error   = np.full((*gt_np.shape, 3), 30, dtype=np.uint8)  # dark grey base
     error[valid & correct]  = [255, 255, 255]   # correct  → white
     error[valid & ~correct] = [220,  50,  50]   # wrong    → red
-    error[~valid]           = [20,   20,  20]   # ignored  → dark grey
 
-    # ---- Plot --------------------------------------------------------
+    # ---- figure ------------------------------------------------------
     fig, axes = plt.subplots(1, 4, figsize=(22, 6))
 
-    axes[0].imshow(rgb)
-    axes[0].set_title("S2 RGB", fontsize=12)
-    axes[0].axis("off")
+    for ax, img, title in zip(
+        axes,
+        [rgb, gt_rgb, pred_rgb, error],
+        ["S2 RGB", "Ground Truth", "Prediction", "Error Map"],
+    ):
+        ax.imshow(img)
+        ax.set_title(title, fontsize=12)
+        ax.axis("off")
 
-    im_gt = axes[1].imshow(gt_display, cmap=cmap_list, vmin=0, vmax=len(class_names) - 1,
-                           interpolation="nearest")
-    axes[1].set_title("Ground Truth", fontsize=12)
-    axes[1].axis("off")
-
-    axes[2].imshow(pred_display, cmap=cmap_list, vmin=0, vmax=len(class_names) - 1,
-                   interpolation="nearest")
-    axes[2].set_title("Prediction", fontsize=12)
-    axes[2].axis("off")
-
-    axes[3].imshow(error)
-    axes[3].set_title("Error Map", fontsize=12)
-    axes[3].axis("off")
-
-    # Legend: only classes present in this patch
-    present_ids = set(np.unique(gt_np[valid]).tolist())
+    # Legend: only classes present in this patch + nodata entry
+    present_ids = set(int(v) for v in np.unique(gt_np[valid]))
     legend_patches = []
     for i, (name, color) in enumerate(zip(class_names, class_colors)):
         if i in present_ids:
@@ -287,10 +265,9 @@ def plot_qualitative_sample(
                 mpatches.Patch(facecolor=(r, g, b), edgecolor="black",
                                label=f"{i}: {name}")
             )
-    # Always add ignored entry
     legend_patches.append(
-        mpatches.Patch(facecolor=(20/255, 20/255, 20/255), edgecolor="black",
-                       label="255: No data / Ignored")
+        mpatches.Patch(facecolor=(30/255, 30/255, 30/255), edgecolor="black",
+                       label="No data / Ignored")
     )
 
     fig.legend(
@@ -307,71 +284,73 @@ def plot_qualitative_sample(
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         plt.savefig(save_path, bbox_inches="tight", dpi=150)
         logger.info(f"Qualitative sample saved: {save_path}")
+    else:
+        plt.show()
     plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
-# Standalone reference-map viewer  (mirrors reference code exactly)
+# Standalone reference-map viewer (mirrors reference diagnostic script)
 # ---------------------------------------------------------------------------
 
 def plot_reference_map(
     tif_path: str,
-    raw_to_train: Optional[dict] = None,
+    raw_to_train: Optional[Dict[int, int]] = None,
     save_path: Optional[str] = None,
 ) -> None:
     """
-    Visualize a raw reference TIFF using the BigEarthNet colormap.
+    Visualize a raw reference TIFF with BigEarthNet colors.
 
-    Mirrors the reference diagnostic code so the output looks identical.
-    If raw_to_train is None, CLC_TO_TRAIN_ID is used.
+    Reads the raw CLC IDs, converts them to train IDs, and displays
+    with the same colors as plot_qualitative_sample.
+    Pixels with value 0 (nodata) are shown as light grey.
 
     Args:
-        tif_path:     Path to the reference TIFF file.
-        raw_to_train: Optional override mapping raw IDs → train IDs.
-        save_path:    Where to save the PNG (shown interactively if None).
+        tif_path:     Path to reference TIFF.
+        raw_to_train: Override CLC→train_id mapping (default: CLC_TO_TRAIN_ID).
+        save_path:    Where to save. Interactive display if None.
     """
     import rasterio
 
     mapping = raw_to_train or CLC_TO_TRAIN_ID
+    color_map = build_color_map(BIGEARTHNET_COLORS, ignore_index=255)
+    # Nodata (value 0 in TIFF) → light grey in the color map
+    color_map[0] = [200, 200, 200]
 
     with rasterio.open(tif_path) as src:
-        data   = src.read(1)
-        nodata = src.nodata
+        raw = src.read(1).astype(np.int32)
 
-    # Convert raw CLC IDs → train IDs
-    segmentation = np.full(data.shape, len(BIGEARTHNET_CLASS_NAMES), dtype=np.int32)
+    # Convert CLC IDs → train IDs; unmapped → 255 (shown as dark grey)
+    out = np.full(raw.shape, 255, dtype=np.uint8)
     for raw_id, train_id in mapping.items():
-        segmentation[data == raw_id] = train_id
-    if nodata is not None:
-        segmentation[data == int(nodata)] = len(BIGEARTHNET_CLASS_NAMES)  # background
+        out[raw == raw_id] = train_id
 
-    # Add a background/nodata color
-    all_colors = BIGEARTHNET_COLORS + ["#d9d9d9"]   # grey for nodata
-    cmap = ListedColormap(all_colors)
+    rgb = mask_to_rgb(out, color_map)
 
-    fig, ax = plt.subplots(figsize=(10, 8))
-    ax.imshow(segmentation, cmap=cmap,
-              vmin=0, vmax=len(all_colors) - 1,
-              interpolation="nearest")
-    ax.set_title(os.path.basename(tif_path), fontsize=10)
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.imshow(rgb)
+    ax.set_title(os.path.basename(tif_path), fontsize=9)
     ax.axis("off")
 
-    legend_items = [
-        mpatches.Patch(facecolor=BIGEARTHNET_COLORS[i], edgecolor="black",
-                       label=f"{i}: {name}")
-        for i, name in enumerate(BIGEARTHNET_CLASS_NAMES)
-        if i in np.unique(segmentation)
+    # Legend: present classes only
+    present = set(int(v) for v in np.unique(out) if v != 255)
+    patches = [
+        mpatches.Patch(
+            facecolor=tuple(c / 255 for c in color_map[i]),
+            edgecolor="black",
+            label=f"{i}: {BIGEARTHNET_CLASS_NAMES[i]}",
+        )
+        for i in sorted(present)
     ]
-    legend_items.append(
-        mpatches.Patch(facecolor="#d9d9d9", edgecolor="black", label="No data")
+    patches.append(
+        mpatches.Patch(facecolor=(200/255,)*3, edgecolor="black", label="No data")
     )
-    ax.legend(handles=legend_items, bbox_to_anchor=(1.02, 1),
+    ax.legend(handles=patches, bbox_to_anchor=(1.02, 1),
               loc="upper left", fontsize=8)
 
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, bbox_inches="tight", dpi=150)
-        logger.info(f"Reference map plot saved: {save_path}")
     else:
         plt.show()
     plt.close(fig)
@@ -397,7 +376,8 @@ def plot_confusion_matrix(
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     n = len(class_names)
-    ax.set_xticks(range(n));  ax.set_yticks(range(n))
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
     ax.set_xticklabels([str(i) for i in range(n)], rotation=45,
                        ha="right", fontsize=8)
     ax.set_yticklabels([str(i) for i in range(n)], fontsize=8)
@@ -416,280 +396,24 @@ def plot_confusion_matrix(
 # ---------------------------------------------------------------------------
 
 def plot_training_curves(history_csv: str, save_path: str) -> None:
-    """Plot train/val loss and val mIoU over epochs."""
+    """Plot train/val loss and val mIoU over epochs from training_history CSV."""
     import pandas as pd
-    df = pd.read_csv(history_csv)
 
+    df = pd.read_csv(history_csv)
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     axes[0].plot(df["epoch"], df["train_loss"], label="Train Loss", color="tab:blue")
     axes[0].plot(df["epoch"], df["val_loss"],   label="Val Loss",   color="tab:orange")
-    axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Loss")
-    axes[0].set_title("Loss"); axes[0].legend(); axes[0].grid(True, alpha=0.3)
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].set_title("Loss")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
 
     axes[1].plot(df["epoch"], df["val_miou"], label="Val mIoU", color="tab:green")
     if "val_dice" in df.columns:
         axes[1].plot(df["epoch"], df["val_dice"], label="Val Dice",
                      color="tab:red", linestyle="--")
-    axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Score")
-    axes[1].set_title("Validation Metrics"); axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-
-    plt.suptitle("Training Progress")
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    logger.info(f"Training curves saved: {save_path}")
-    plt.close(fig)
-
-from __future__ import annotations
-
-import logging
-import os
-from typing import List, Optional
-
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
-
-logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Color utilities
-# ---------------------------------------------------------------------------
-
-def hex_to_rgb(hex_color: str) -> tuple:
-    """Convert hex color string to (R, G, B) tuple in [0, 1]."""
-    h = hex_color.lstrip("#")
-    return tuple(int(h[i:i+2], 16) / 255.0 for i in (0, 2, 4))
-
-
-def build_color_map(class_colors: List[str], ignore_index: int = 255) -> np.ndarray:
-    """
-    Build a [256, 3] uint8 color lookup table.
-
-    Index 0..N-1 map to class colors.
-    Index ignore_index maps to black (0, 0, 0).
-    """
-    color_map = np.zeros((256, 3), dtype=np.uint8)
-    for i, hex_c in enumerate(class_colors):
-        r, g, b = hex_to_rgb(hex_c)
-        color_map[i] = [int(r*255), int(g*255), int(b*255)]
-    color_map[ignore_index % 256] = [0, 0, 0]
-    return color_map
-
-
-def mask_to_rgb(mask: np.ndarray, color_map: np.ndarray) -> np.ndarray:
-    """
-    Convert an integer mask [H, W] to an RGB image [H, W, 3].
-
-    Args:
-        mask:      [H, W] integer array with values 0..N-1 or ignore_index.
-        color_map: [256, 3] uint8 color lookup.
-
-    Returns:
-        RGB image [H, W, 3] uint8.
-    """
-    mask_clipped = np.clip(mask.astype(np.int32), 0, 255)
-    return color_map[mask_clipped]
-
-
-# ---------------------------------------------------------------------------
-# S2 band visualization helper
-# ---------------------------------------------------------------------------
-
-def s2_to_rgb(s2: torch.Tensor, norm_mean: Optional[List] = None,
-              norm_std: Optional[List] = None) -> np.ndarray:
-    """
-    Convert a normalized S2 tensor to a display-ready RGB image.
-
-    Uses bands B04 (red, index 3), B03 (green, index 2), B02 (blue, index 1).
-
-    Steps:
-        1. Denormalize using training-set mean/std if provided.
-        2. Extract RGB channels.
-        3. Clip to [0, 1] reflectance.
-        4. Apply gamma correction (γ=2.2→display) for visibility.
-
-    Returns:
-        [H, W, 3] float32 array in [0, 1].
-    """
-    arr = s2.cpu().numpy().astype(np.float32)  # [12, H, W]
-
-    if norm_mean is not None and norm_std is not None:
-        mean = np.array(norm_mean, dtype=np.float32).reshape(12, 1, 1)
-        std  = np.array(norm_std,  dtype=np.float32).reshape(12, 1, 1)
-        arr = arr * std + mean  # denormalize to reflectance
-
-    # B04=index3 (R), B03=index2 (G), B02=index1 (B)
-    rgb = np.stack([arr[3], arr[2], arr[1]], axis=-1)  # [H, W, 3]
-
-    # Clip and stretch to visible range (reflectance 0–0.3 is typical)
-    rgb = np.clip(rgb, 0.0, 0.3) / 0.3
-    # Mild gamma for display
-    rgb = np.power(np.clip(rgb, 0, 1), 0.5)
-    return rgb.astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
-# Qualitative sample plot
-# ---------------------------------------------------------------------------
-
-def plot_qualitative_sample(
-    s2: torch.Tensor,
-    gt_mask: torch.Tensor,
-    pred_mask: torch.Tensor,
-    class_names: List[str],
-    class_colors: List[str],
-    ignore_index: int = 255,
-    save_path: Optional[str] = None,
-    norm_mean: Optional[List] = None,
-    norm_std: Optional[List] = None,
-) -> None:
-    """
-    Plot a 4-panel figure: RGB composite | Ground truth | Prediction | Error map.
-
-    Error map highlights:
-        - Correct pixels: white
-        - Wrong predictions: red
-        - Ignored pixels: black
-
-    Args:
-        s2:           [12, H, W] tensor.
-        gt_mask:      [H, W] integer tensor.
-        pred_mask:    [H, W] integer tensor.
-        class_names:  List of class name strings.
-        class_colors: Hex color strings.
-        ignore_index: Label to treat as ignore.
-        save_path:    Where to save the figure.
-        norm_mean/std: Used to denormalize for display.
-    """
-    color_map = build_color_map(class_colors, ignore_index)
-
-    rgb = s2_to_rgb(s2, norm_mean, norm_std)
-    gt_np   = gt_mask.numpy().astype(np.int32)
-    pred_np = pred_mask.numpy().astype(np.int32)
-
-    gt_rgb   = mask_to_rgb(gt_np,   color_map)
-    pred_rgb = mask_to_rgb(pred_np, color_map)
-
-    # Error map
-    valid = gt_np != ignore_index
-    correct = (gt_np == pred_np) & valid
-    error_map = np.zeros((*gt_np.shape, 3), dtype=np.uint8)
-    error_map[valid & correct]  = [255, 255, 255]   # correct: white
-    error_map[valid & ~correct] = [220,  50,  50]   # wrong:   red
-    # ignored pixels stay black (0, 0, 0)
-
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-    titles = ["S2 RGB", "Ground Truth", "Prediction", "Error Map"]
-    images = [rgb, gt_rgb, pred_rgb, error_map]
-
-    for ax, img, title in zip(axes, images, titles):
-        ax.imshow(img)
-        ax.set_title(title, fontsize=12)
-        ax.axis("off")
-
-    # Legend
-    legend_patches = []
-    for i, (name, color) in enumerate(zip(class_names, class_colors)):
-        r, g, b = hex_to_rgb(color)
-        legend_patches.append(
-            mpatches.Patch(facecolor=(r, g, b), label=f"{i}: {name}")
-        )
-    fig.legend(
-        handles=legend_patches,
-        loc="lower center",
-        ncol=min(len(class_names), 10),
-        fontsize=7,
-        frameon=True,
-        bbox_to_anchor=(0.5, -0.05),
-    )
-
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, bbox_inches="tight", dpi=150)
-        logger.info(f"Qualitative figure saved: {save_path}")
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# Confusion matrix plot
-# ---------------------------------------------------------------------------
-
-def plot_confusion_matrix(
-    cm: np.ndarray,
-    class_names: List[str],
-    save_path: str,
-) -> None:
-    """
-    Plot and save a normalized confusion matrix heatmap.
-
-    Rows = ground truth, columns = predicted.
-    Values are normalized by row (recall per class).
-    """
-    # Normalize by row (true class total)
-    row_sums = cm.sum(axis=1, keepdims=True)
-    cm_norm = np.divide(
-        cm.astype(float), row_sums,
-        out=np.zeros_like(cm, dtype=float),
-        where=row_sums > 0,
-    )
-
-    fig, ax = plt.subplots(figsize=(14, 12))
-    im = ax.imshow(cm_norm, cmap="Blues", vmin=0, vmax=1, aspect="auto")
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-    n = len(class_names)
-    ax.set_xticks(range(n))
-    ax.set_yticks(range(n))
-    short = [f"{i}" for i in range(n)]
-    ax.set_xticklabels(short, rotation=45, ha="right", fontsize=8)
-    ax.set_yticklabels(short, fontsize=8)
-    ax.set_xlabel("Predicted Class")
-    ax.set_ylabel("True Class")
-    ax.set_title("Normalized Confusion Matrix (recall per row)")
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    logger.info(f"Confusion matrix saved: {save_path}")
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# Training curves
-# ---------------------------------------------------------------------------
-
-def plot_training_curves(
-    history_csv: str,
-    save_path: str,
-) -> None:
-    """
-    Plot training loss, validation loss, and validation mIoU over epochs.
-
-    Args:
-        history_csv: Path to training_history.csv.
-        save_path:   Where to save the PNG.
-    """
-    import pandas as pd
-    df = pd.read_csv(history_csv)
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    # Loss plot
-    axes[0].plot(df["epoch"], df["train_loss"], label="Train Loss", color="tab:blue")
-    axes[0].plot(df["epoch"], df["val_loss"],   label="Val Loss",   color="tab:orange")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("Loss")
-    axes[0].set_title("Training and Validation Loss")
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-
-    # mIoU plot
-    axes[1].plot(df["epoch"], df["val_miou"], label="Val mIoU", color="tab:green")
-    if "val_dice" in df.columns:
-        axes[1].plot(df["epoch"], df["val_dice"], label="Val Dice", color="tab:red", linestyle="--")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Score")
     axes[1].set_title("Validation Metrics")
