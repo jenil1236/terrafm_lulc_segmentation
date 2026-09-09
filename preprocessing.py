@@ -304,11 +304,27 @@ def read_reference_mask(
     Uses nearest-neighbour reprojection (mandatory for categorical data –
     bilinear would produce fractional class IDs that corrupt the labels).
 
+    IMPORTANT: destination array is uint32 to safely hold raw class IDs
+    that may exceed 255 (e.g. CLC codes like 311, 512). Remapping to
+    uint8 happens AFTER reprojection, once values are in 0..N-1 range.
+
     Returns:
         uint8 [H, W] array: values in {0..N-1, ignore_index}.
     """
+    # Use a large sentinel nodata value that won't collide with any real
+    # class ID (CLC codes are at most 4 digits). Using 0 as nodata here
+    # would be wrong if 0 is a valid class ID in another dataset.
+    REPROJECT_NODATA = 65535  # safe sentinel for uint32 destination
+
     with rasterio.open(mask_path) as src:
-        dest = np.zeros((target_height, target_width), dtype=np.uint8)
+        src_nodata = src.nodata
+
+        # Reproject into a uint32 array so raw IDs > 255 are preserved
+        dest = np.full(
+            (target_height, target_width),
+            fill_value=REPROJECT_NODATA,
+            dtype=np.uint32,
+        )
         reproject(
             source=rasterio.band(src, 1),
             destination=dest,
@@ -317,14 +333,35 @@ def read_reference_mask(
             dst_transform=target_transform,
             dst_crs=target_crs,
             resampling=Resampling.nearest,
-            src_nodata=src.nodata,
-            dst_nodata=ignore_index,
+            src_nodata=src_nodata,
+            dst_nodata=REPROJECT_NODATA,
         )
 
-    # Remap raw IDs → contiguous training IDs
-    output = np.full_like(dest, fill_value=ignore_index, dtype=np.uint8)
+    # Anything that is the source nodata or the reproject sentinel → ignore
+    nodata_mask = (dest == REPROJECT_NODATA)
+    if src_nodata is not None:
+        nodata_mask |= (dest == int(src_nodata))
+
+    # Sanity check: if >95% of pixels are nodata after reprojection,
+    # it almost certainly means the S2 and reference grids don't overlap
+    # (CRS mismatch or wrong spatial extent). Warn loudly.
+    nodata_ratio = nodata_mask.mean()
+    if nodata_ratio > 0.95:
+        logger.warning(
+            f"read_reference_mask: {nodata_ratio*100:.1f}% of pixels are nodata "
+            f"after reprojection from '{mask_path}'. "
+            "This usually means the S2 patch and reference map have different CRS "
+            "or non-overlapping spatial extents. "
+            "Check that both files cover the same geographic area."
+        )
+
+    # Remap raw IDs → contiguous training IDs (0..N-1)
+    output = np.full((target_height, target_width), fill_value=ignore_index, dtype=np.uint8)
     for raw_id, train_id in raw_to_train.items():
         output[dest == raw_id] = train_id
+
+    # Ensure nodata pixels are always ignore_index regardless of remapping
+    output[nodata_mask] = ignore_index
 
     return output
 
