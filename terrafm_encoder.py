@@ -14,7 +14,7 @@ What goes in:
 
 What comes out:
     - List of 4 feature maps, each [B, embed_dim, 14, 14]
-      (patch grid = 224/16 = 14 per side)
+      (patch grid = 224/16 = 14 per side; embed_dim = 768 for ViT-B)
 
 How it connects:
     model.py wraps TerraFMEncoder + UPerNetDecoder into TerraFMLULC.
@@ -25,24 +25,21 @@ TerraFM's pretrained patch embedding was trained on modality-specific
 inputs.  When we fuse S2 (12ch) + S1 (2ch) into a single 14-channel
 tensor we need to expand the embedding's input projection.
 
-CONFIRMED from TerraFM paper / repo:
-  - TerraFM uses modality-specific patch embeddings with cross-attention
-    fusion, so it natively handles multi-modal input.
-  - When loaded via AutoModel the model may already accept S1+S2 jointly.
-  - If the loaded model only accepts 12-ch S2, we expand the first Conv2d
-    weight to 14 channels using weight inflation:
-      new_weight[:, :12, :, :] = pretrained_weight   (S2 channels)
-      new_weight[:,12:14,:, :] = mean(pretrained_weight, dim=1, keepdim=True)
-                                  × 2                 (S1 channels, init)
-    This preserves all pretrained S2 representations while giving the
-    two new S1 channels a sensible starting point.
+CONFIRMED from TerraFM checkpoint keys:
+  - TerraFM-B transformer embed_dim = 768   (blocks.0.norm1.weight shape [768])
+  - patch_embed.conv2d_s2_l2a.weight shape [2304, 12, 16, 16]
+    → out_channels = 2304 is the patch embed output (NOT the transformer dim)
+    → the official class projects 2304 → 768 internally
+  - The official terrafm.py class must be loaded from the snapshot so that
+    all modality-specific projections and cross-attention fusion are intact.
 
-ENGINEERING RECOMMENDATION:
-  - We first try to load the model as-is and inspect its patch-embed
-    input channel count.
-  - If in_channels == 14: model natively handles the fused tensor (ideal).
-  - If in_channels == 12: we inflate the weight (safe fallback).
-  - If in_channels == anything else: we raise a clear error.
+LOADING STRATEGY:
+  1. Download snapshot (or use cached copy).
+  2. Import terrafm.py from snapshot via importlib.
+  3. Instantiate the official TerraFM class.
+  4. Load checkpoint into that class with strict=False.
+  5. Detect actual embed_dim from blocks.0.norm1.weight shape (= 768).
+  6. Inflate patch embedding input channels from 12 → 14.
 -------------------------------------------------------------------
 """
 
@@ -71,6 +68,7 @@ class TerraFMEncoder(nn.Module):
     def __init__(self, model_size: str = "base", freeze_stage: int = 0):
         super().__init__()
         self.model_size        = model_size
+        # Default embed_dim; will be overridden by checkpoint detection at load time
         self.embed_dim         = 768 if model_size == "base" else 1024
         self.num_blocks        = 12  if model_size == "base" else 24
         self.feature_indices   = (
@@ -117,7 +115,69 @@ class TerraFMEncoder(nn.Module):
         return backbone
 
     def _try_load_huggingface(self) -> Optional[nn.Module]:
-        # Approach 1: HF AutoModel with remote code (preferred for TerraFM)
+        # ----------------------------------------------------------------
+        # APPROACH 1: Use terrafm.py from snapshot (authoritative)
+        # ----------------------------------------------------------------
+        try:
+            import glob
+            import os
+            import importlib.util
+            from huggingface_hub import snapshot_download
+
+            local_dir = snapshot_download(
+                repo_id=CFG.terrafm_hub_id,
+                cache_dir=CFG.weights_dir,
+            )
+            logger.info(f"TerraFM snapshot: {local_dir}")
+            logger.info(f"Files: {sorted(os.listdir(local_dir))}")
+
+            # Find terrafm.py
+            terrafm_py = os.path.join(local_dir, "terrafm.py")
+            if not os.path.exists(terrafm_py):
+                raise FileNotFoundError(f"terrafm.py not in {local_dir}")
+
+            # Import it dynamically
+            spec = importlib.util.spec_from_file_location("terrafm_official", terrafm_py)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            # Find checkpoint (.pth or .pt)
+            ckpts = sorted(
+                glob.glob(os.path.join(local_dir, "*.pth")) +
+                glob.glob(os.path.join(local_dir, "*.pt"))
+            )
+            if not ckpts:
+                raise FileNotFoundError(f"No .pth/.pt in {local_dir}")
+            ckpt_path = ckpts[0]
+            logger.info(f"Checkpoint: {ckpt_path}")
+
+            state = torch.load(ckpt_path, map_location="cpu")
+            state = state.get("model", state.get("state_dict", state))
+
+            # Detect true transformer embed_dim from block norm weights
+            # (= 768 for TerraFM-B, NOT 2304 which is the patch embed output)
+            for k, v in state.items():
+                if "blocks.0.norm1.weight" in k:
+                    self.embed_dim = int(v.shape[0])
+                    logger.info(f"Detected transformer embed_dim={self.embed_dim} "
+                                f"from {k} shape {list(v.shape)}")
+                    break
+
+            # Instantiate official model from terrafm.py
+            model = self._instantiate_from_module(module, state)
+
+            result = model.load_state_dict(state, strict=False)
+            self._verify_load(result, len(state))
+            logger.info("TerraFM loaded via official terrafm.py")
+            self._log_model_info(model)
+            return model
+
+        except Exception as e1:
+            logger.warning(f"terrafm.py approach failed: {e1}")
+
+        # ----------------------------------------------------------------
+        # APPROACH 2: AutoModel with trust_remote_code
+        # ----------------------------------------------------------------
         try:
             from transformers import AutoModel
             model = AutoModel.from_pretrained(
@@ -125,132 +185,73 @@ class TerraFMEncoder(nn.Module):
                 trust_remote_code=True,
                 cache_dir=CFG.weights_dir,
             )
-            logger.info("TerraFM loaded via AutoModel (trust_remote_code=True)")
-            self._log_model_info(model)
-            return model
-        except Exception as e1:
-            logger.warning(f"AutoModel load failed: {e1}")
-
-        # Approach 2: timm via HF Hub
-        try:
-            import timm
-            model = timm.create_model(
-                f"hf_hub:{CFG.terrafm_hub_id}",
-                pretrained=True,
-                num_classes=0,
-                in_chans=CFG.s2_num_channels,   # load as 12-ch first
-                img_size=CFG.image_size,
-            )
-            logger.info("TerraFM loaded via timm from HF Hub")
+            self._detect_embed_dim_from_model(model)
+            logger.info("TerraFM loaded via AutoModel")
             self._log_model_info(model)
             return model
         except Exception as e2:
-            logger.warning(f"timm HF Hub load failed: {e2}")
-
-        # Approach 3: Snapshot download + manual weight load
-        try:
-            import glob, os
-            from huggingface_hub import snapshot_download
-            local_dir = snapshot_download(
-                repo_id=CFG.terrafm_hub_id,
-                cache_dir=CFG.weights_dir,
-            )
-            ckpts = (
-                glob.glob(os.path.join(local_dir, "*.pth")) +
-                glob.glob(os.path.join(local_dir, "*.pt"))
-            )
-            if not ckpts:
-                raise FileNotFoundError(f"No .pth/.pt checkpoint in {local_dir}")
-            ckpt_path = ckpts[0]
-            logger.info(f"Loading from local checkpoint: {ckpt_path}")
-            model = self._build_bare_vit()
-            state = torch.load(ckpt_path, map_location="cpu")
-            state = state.get("model", state.get("state_dict", state))
-
-            # TerraFM uses modality-specific patch embed keys.
-            # Remap conv2d_s2_l2a → patch_embed.proj so the timm ViT scaffold
-            # receives the correct pretrained S2 weights.
-            remap = {
-                "patch_embed.conv2d_s2_l2a.weight": "patch_embed.proj.weight",
-                "patch_embed.conv2d_s2_l2a.bias":   "patch_embed.proj.bias",
-            }
-            for src_key, dst_key in remap.items():
-                if src_key in state and dst_key not in state:
-                    state[dst_key] = state[src_key]
-                    logger.info(f"Remapped {src_key} → {dst_key}")
-
-            result = model.load_state_dict(state, strict=False)
-            self._verify_load(result, len(state))
-            return model
-        except Exception as e3:
-            logger.error(f"Snapshot load failed: {e3}")
+            logger.warning(f"AutoModel failed: {e2}")
 
         return None
 
-    def _build_bare_vit(self) -> nn.Module:
-        """
-        Build a standard timm ViT scaffold to receive raw TerraFM-B weights.
+    def _instantiate_from_module(self, module, state: dict) -> nn.Module:
+        """Try all common factory patterns found in terrafm.py."""
+        # Try known class names and factory functions
+        for name in [
+            "TerraFM", "TerraFMBase", "TerraFMLarge",
+            "build_terrafm", "build_model", "create_model",
+            "terrafm_base", "terrafm_large",
+        ]:
+            obj = getattr(module, name, None)
+            if obj is None:
+                continue
+            for kwargs in [
+                {"size": "base"}, {"model_size": "base"}, {"variant": "base"},
+                {"pretrained": False}, {},
+            ]:
+                try:
+                    if isinstance(obj, type) and issubclass(obj, nn.Module):
+                        m = obj(**kwargs) if kwargs else obj()
+                    else:
+                        m = obj(**kwargs) if kwargs else obj()
+                    if isinstance(m, nn.Module):
+                        logger.info(f"Instantiated via {name}({kwargs})")
+                        return m
+                except Exception:
+                    continue
 
-        TerraFM-B's patch embedding projects to 2304 channels
-        (= 768 × 3, one per modality: S2-L2A, S2-L1C, S1), NOT the
-        standard 768.  We set embed_dim=2304 so the checkpoint weights
-        load without a shape mismatch.
+        # Fallback: scan for any nn.Module subclass in the module
+        for name in sorted(dir(module)):
+            if name.startswith("_"):
+                continue
+            obj = getattr(module, name)
+            if (
+                isinstance(obj, type)
+                and issubclass(obj, nn.Module)
+                and obj is not nn.Module
+            ):
+                try:
+                    m = obj()
+                    if isinstance(m, nn.Module):
+                        logger.info(f"Instantiated via {name}()")
+                        return m
+                except Exception:
+                    pass
 
-        The transformer blocks still operate at embed_dim=2304 and we
-        extract features at that dimensionality. The UPerNet lateral
-        convs handle the projection down to decoder_channels=256.
-        """
-        import timm
-
-        # Detect the true embed_dim from the checkpoint before building
-        # so we don't hard-code a wrong value if a future version changes.
-        checkpoint_embed_dim = self._probe_checkpoint_embed_dim()
-        actual_embed_dim = checkpoint_embed_dim if checkpoint_embed_dim else 2304
-
-        if actual_embed_dim != self.embed_dim:
-            import logging
-            logging.getLogger(__name__).info(
-                f"TerraFM-B checkpoint embed_dim={actual_embed_dim} "
-                f"(overrides default {self.embed_dim}). "
-                "Updating encoder embed_dim to match checkpoint."
-            )
-            self.embed_dim = actual_embed_dim
-
-        name = ("vit_base_patch16_224" if self.model_size == "base"
-                else "vit_large_patch16_224")
-        return timm.create_model(
-            name,
-            pretrained=False,
-            num_classes=0,
-            in_chans=CFG.s2_num_channels,   # 12  (inflated to 14 after load)
-            img_size=CFG.image_size,
-            embed_dim=actual_embed_dim,      # match checkpoint exactly
+        raise RuntimeError(
+            f"Cannot instantiate model from terrafm.py. "
+            f"Names: {[n for n in dir(module) if not n.startswith('_')]}"
         )
 
-    def _probe_checkpoint_embed_dim(self) -> int:
-        """
-        Peek at the checkpoint to read the true patch embedding output dim.
-        Returns 0 if the checkpoint cannot be found or read.
-        """
-        try:
-            import glob, os, torch
-            cache_root = CFG.weights_dir
-            pattern = os.path.join(
-                cache_root, "models--MBZUAI--TerraFM", "snapshots",
-                "*", "TerraFM-B.pth"
-            )
-            ckpts = glob.glob(pattern)
-            if not ckpts:
-                return 0
-            # Load only the patch embed weight tensor (fast, no full load)
-            state = torch.load(ckpts[0], map_location="cpu")
-            state = state.get("model", state.get("state_dict", state))
-            key = "patch_embed.conv2d_s2_l2a.weight"
-            if key in state:
-                return int(state[key].shape[0])   # out_channels
-        except Exception:
-            pass
-        return 0
+    def _detect_embed_dim_from_model(self, model: nn.Module) -> None:
+        """Read actual embed_dim from loaded model parameters."""
+        for name, param in model.named_parameters():
+            if "blocks.0.norm1.weight" in name or "layer.0" in name:
+                self.embed_dim = int(param.shape[0])
+                logger.info(
+                    f"Detected embed_dim={self.embed_dim} from {name}"
+                )
+                return
 
     # ------------------------------------------------------------------
     # Patch-embed channel adaptation
@@ -264,11 +265,6 @@ class TerraFMEncoder(nn.Module):
             patch_embed.conv2d_s2_l2a  (12-channel S2 L2A)
             patch_embed.conv2d_s2_l1c  (12-channel S2 L1C)
             patch_embed.conv2d_s1      ( 2-channel S1)
-
-        The timm ViT scaffold (used as fallback) has a standard
-        patch_embed.proj Conv2d. We need to:
-          1. Load conv2d_s2_l2a weights from the checkpoint into patch_embed.proj
-          2. Inflate from 12 → 14 channels (adding S1 channels)
 
         Cases handled:
           A) model already has in_channels == 14  → no change.
@@ -297,24 +293,21 @@ class TerraFMEncoder(nn.Module):
                 f"Unexpected patch embedding in_channels={current_in}. "
                 f"Expected {CFG.s2_num_channels} (S2-only) or {target_in} (S1+S2)."
             )
-        # TerraFM stores them under patch_embed.conv2d_s2_l2a.weight.
-        # If found, use them; otherwise fall back to the current conv weights.
-        # ------------------------------------------------------------------
-        s2_weight = conv.weight.data   # [out, 12, ph, pw] — may be random if
-                                        # the checkpoint keys didn't match
 
-        # Look in the backbone's state_dict for the TerraFM-specific key
-        sd = {k: v for k, v in self.backbone.state_dict().items()}
+        # TerraFM stores pretrained S2 L2A weights under conv2d_s2_l2a.weight.
+        # Use them if available; otherwise fall back to current conv weights.
+        s2_weight = conv.weight.data   # [out, 12, ph, pw]
+
+        sd = dict(model.state_dict())
         terrafm_key = "patch_embed.conv2d_s2_l2a.weight"
         if terrafm_key not in sd:
-            # Also try without the patch_embed prefix
             for k in sd:
                 if "conv2d_s2_l2a.weight" in k:
                     terrafm_key = k
                     break
 
         if terrafm_key in sd:
-            candidate = sd[terrafm_key]   # [out, 12, ph, pw]
+            candidate = sd[terrafm_key]
             if candidate.shape == s2_weight.shape:
                 s2_weight = candidate.clone()
                 logger.info(
@@ -323,8 +316,8 @@ class TerraFMEncoder(nn.Module):
                 )
             else:
                 logger.warning(
-                    f"conv2d_s2_l2a shape {candidate.shape} != "
-                    f"expected {s2_weight.shape}. Using current weights."
+                    f"conv2d_s2_l2a shape {list(candidate.shape)} != "
+                    f"expected {list(s2_weight.shape)}. Using current weights."
                 )
         else:
             logger.warning(
@@ -348,7 +341,7 @@ class TerraFMEncoder(nn.Module):
         )
         with torch.no_grad():
             new_conv.weight[:, :current_in, :, :] = s2_weight
-            # S1 channels: mean of S2 weights × 2 for a reasonable init
+            # S1 channels: mean of S2 weights × 2 for a sensible init
             s1_init = s2_weight.mean(dim=1, keepdim=True).expand(
                 -1, target_in - current_in, -1, -1
             ) * 2.0
@@ -379,7 +372,7 @@ class TerraFMEncoder(nn.Module):
                     return obj
             except AttributeError:
                 continue
-        # Generic search
+        # Generic search: first Conv2d with "patch" in its module path
         for name, module in model.named_modules():
             if isinstance(module, nn.Conv2d) and "patch" in name.lower():
                 return module
@@ -420,20 +413,29 @@ class TerraFMEncoder(nn.Module):
         missing    = result.missing_keys
         unexpected = result.unexpected_keys
         if missing:
-            logger.warning(f"Missing keys ({len(missing)}): {missing[:10]}"
-                           f"{'...' if len(missing) > 10 else ''}")
+            logger.warning(
+                f"Missing keys ({len(missing)}): {missing[:10]}"
+                f"{'...' if len(missing) > 10 else ''}"
+            )
         if unexpected:
-            logger.warning(f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+            logger.warning(
+                f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}"
+            )
 
-        # Ignore the original modality-specific keys as "unexpected" —
-        # they were remapped before load_state_dict was called.
-        ignorable = {"patch_embed.s2_l2a_embed", "patch_embed.s2_l1c_embed",
-                     "patch_embed.s1_embed", "patch_embed.conv2d_s2_l2a.weight",
-                     "patch_embed.conv2d_s2_l2a.bias",
-                     "patch_embed.conv2d_s2_l1c.weight",
-                     "patch_embed.conv2d_s2_l1c.bias",
-                     "patch_embed.conv2d_s1.weight",
-                     "patch_embed.conv2d_s1.bias"}
+        # Modality-specific patch embed keys are expected to be "unexpected"
+        # when loading into an official TerraFM class — that class handles
+        # them internally.  Exclude them from the mismatch ratio check.
+        ignorable = {
+            "patch_embed.s2_l2a_embed",
+            "patch_embed.s2_l1c_embed",
+            "patch_embed.s1_embed",
+            "patch_embed.conv2d_s2_l2a.weight",
+            "patch_embed.conv2d_s2_l2a.bias",
+            "patch_embed.conv2d_s2_l1c.weight",
+            "patch_embed.conv2d_s2_l1c.bias",
+            "patch_embed.conv2d_s1.weight",
+            "patch_embed.conv2d_s1.bias",
+        }
         real_missing = [k for k in missing if k not in ignorable]
         ratio = len(real_missing) / max(total_keys, 1)
         if ratio > 0.10:
@@ -441,7 +443,9 @@ class TerraFMEncoder(nn.Module):
                 f"Checkpoint mismatch: {len(real_missing)}/{total_keys} keys missing "
                 f"({ratio*100:.1f}%). Wrong model_size or corrupted checkpoint."
             )
-        logger.info(f"Weights loaded: {total_keys - len(missing)}/{total_keys} matched.")
+        logger.info(
+            f"Weights loaded: {total_keys - len(missing)}/{total_keys} matched."
+        )
 
     # ------------------------------------------------------------------
     # Hooks (fallback feature extraction)
@@ -527,7 +531,9 @@ class TerraFMEncoder(nn.Module):
                 p.requires_grad = True
             logger.info("TerraFM encoder: ALL unfrozen (Stage 2)")
 
-        trainable = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
+        trainable = sum(
+            p.numel() for p in self.backbone.parameters() if p.requires_grad
+        )
         logger.info(f"  Trainable encoder params: {trainable/1e6:.1f}M")
 
     # ------------------------------------------------------------------
@@ -544,6 +550,7 @@ class TerraFMEncoder(nn.Module):
         Returns:
             List of 4 tensors, each [B, embed_dim, 14, 14].
             Ordered from shallow → deep transformer blocks.
+            embed_dim = 768 for ViT-B (confirmed from checkpoint).
 
         SPATIAL NOTE:
             224×224 / 16 patch = 14×14 grid = 196 tokens.
@@ -567,8 +574,13 @@ class TerraFMEncoder(nn.Module):
             for i, feat in enumerate(self._hook_outputs):
                 if feat is None:
                     features.append(
-                        torch.zeros(B, self.num_patches_side**2, self.embed_dim,
-                                    device=fused.device, dtype=fused.dtype)
+                        torch.zeros(
+                            B,
+                            self.num_patches_side ** 2,
+                            self.embed_dim,
+                            device=fused.device,
+                            dtype=fused.dtype,
+                        )
                     )
                 else:
                     features.append(feat)
@@ -576,13 +588,13 @@ class TerraFMEncoder(nn.Module):
         return [self._to_spatial(f, B) for f in features]
 
     def _to_spatial(self, tokens: torch.Tensor, B: int) -> torch.Tensor:
-        """Reshape [B, N, C] (or [B, N+1, C] with CLS) → [B, C, H, W]."""
+        """Reshape [B, N, C] (or [B, N+1, C] with CLS token) → [B, C, H, W]."""
         if tokens.dim() == 2:
             tokens = tokens.unsqueeze(0)
         N = tokens.shape[1]
         exp = self.num_patches_side ** 2   # 196
         if N == exp + 1:
-            tokens = tokens[:, 1:, :]      # remove CLS
+            tokens = tokens[:, 1:, :]      # strip CLS token
         elif N != exp:
             logger.warning(f"Token count {N} ≠ {exp}; truncating.")
             tokens = tokens[:, :exp, :]

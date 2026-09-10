@@ -316,11 +316,11 @@ class Config:
     # ------------------------------------------------------------------
     @property
     def vit_embed_dim(self) -> int:
-        # TerraFM-B patch embedding outputs 2304 (= 768 × 3 fused modalities)
-        # Standard ViT-B is 768 — TerraFM is NOT a standard ViT-B here.
-        # The encoder probes the actual checkpoint at load time and overrides
-        # its own embed_dim, but model.py reads this property to size the decoder.
-        return 2304 if self.model_size == "base" else 3072
+        # TerraFM-B transformer blocks operate at 768-dim (standard ViT-B).
+        # The patch embedding outputs 2304 internally, but projects back to 768
+        # before the transformer. The encoder detects the true value from the
+        # checkpoint at load time and overrides TerraFMEncoder.embed_dim.
+        return 768 if self.model_size == "base" else 1024
 
     @property
     def vit_num_blocks(self) -> int:

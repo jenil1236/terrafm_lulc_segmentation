@@ -64,30 +64,32 @@ CFG.class_colors = BIGEARTHNET_COLORS
 
 ---
 
-## BUG 8 — TerraFM-B patch embedding output dim is 2304, not 768
+## BUG 8 — TerraFM loading: wrong scaffold embed_dim and wrong loading strategy
 
-**File:** `terrafm_encoder.py` → `_build_bare_vit()`, `model.py` → `TerraFMLULC.__init__()`
+**File:** `terrafm_encoder.py`
 
-**Symptom:**
+**Symptom (first error):**
 ```
-RuntimeError: size mismatch for patch_embed.proj.weight:
-  checkpoint shape: [2304, 12, 16, 16]
-  current model:    [ 768, 12, 16, 16]
+size mismatch for patch_embed.proj.weight:
+  checkpoint: [2304, 12, 16, 16]   current model: [768, 12, 16, 16]
 ```
 
-**Root cause:** TerraFM-B fuses three modality-specific patch embeddings
-(S2-L2A, S2-L1C, S1) and concatenates their outputs before the transformer.
-The effective patch embedding output dimension is `768 × 3 = 2304`, not the
-standard ViT-B value of 768. The bare timm ViT scaffold was built with the
-standard `embed_dim=768`, causing the shape mismatch when the remapped
-`conv2d_s2_l2a.weight` (shape [2304, 12, 16, 16]) was loaded into it.
+**Symptom (second error after wrong fix):**
+```
+size mismatch for cls_token: [1,1,768] vs [1,1,2304]
+size mismatch for blocks.0.norm1.weight: [768] vs [2304]
+```
+
+**Root cause:** TerraFM-B has a custom architecture defined in `terrafm.py`:
+- `patch_embed.conv2d_s2_l2a.weight` shape `[2304, 12, 16, 16]` — patch embed outputs 2304
+- `blocks.0.norm1.weight` shape `[768]` — transformer operates at 768
+- TerraFM projects 2304 → 768 internally before the transformer blocks
+
+Using a timm ViT scaffold (which has no 2304→768 projection layer) causes shape mismatches everywhere. Setting `embed_dim=2304` on the scaffold only made it worse.
 
 **Fix:**
-1. `_build_bare_vit()` now calls `_probe_checkpoint_embed_dim()` which peeks
-   at the cached `.pth` file and reads the true output channels of
-   `conv2d_s2_l2a.weight`. It builds the timm ViT with
-   `embed_dim=actual_embed_dim` (2304) instead of hardcoding 768.
-2. `model.py` `TerraFMLULC.__init__()` now builds the encoder first, then
-   reads `self.encoder.embed_dim` (which was updated by the probe) and passes
-   that real value to the `UPerNetDecoder` constructor.
-3. `config.py` `vit_embed_dim` property updated to return 2304 for base.
+1. Prioritise loading via `terrafm.py` from the snapshot using `importlib`. This gives the exact correct architecture.
+2. After loading, detect `embed_dim` from `blocks.0.norm1.weight` shape (= 768, confirmed).
+3. `config.py` `vit_embed_dim` reverted to 768.
+4. `model.py` reads `self.encoder.embed_dim` after encoder is built (not from config) so it adapts to whatever the checkpoint reports.
+5. Removed `_build_bare_vit` and `_probe_checkpoint_embed_dim` entirely.
