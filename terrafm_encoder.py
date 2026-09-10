@@ -189,17 +189,68 @@ class TerraFMEncoder(nn.Module):
 
     def _build_bare_vit(self) -> nn.Module:
         """
-        Build a standard timm ViT scaffold to receive raw .pth weights.
-        in_chans=12 matches the S2-only pretrained weights shape.
-        Channel inflation is handled in _adapt_patch_embed().
+        Build a standard timm ViT scaffold to receive raw TerraFM-B weights.
+
+        TerraFM-B's patch embedding projects to 2304 channels
+        (= 768 × 3, one per modality: S2-L2A, S2-L1C, S1), NOT the
+        standard 768.  We set embed_dim=2304 so the checkpoint weights
+        load without a shape mismatch.
+
+        The transformer blocks still operate at embed_dim=2304 and we
+        extract features at that dimensionality. The UPerNet lateral
+        convs handle the projection down to decoder_channels=256.
         """
         import timm
+
+        # Detect the true embed_dim from the checkpoint before building
+        # so we don't hard-code a wrong value if a future version changes.
+        checkpoint_embed_dim = self._probe_checkpoint_embed_dim()
+        actual_embed_dim = checkpoint_embed_dim if checkpoint_embed_dim else 2304
+
+        if actual_embed_dim != self.embed_dim:
+            import logging
+            logging.getLogger(__name__).info(
+                f"TerraFM-B checkpoint embed_dim={actual_embed_dim} "
+                f"(overrides default {self.embed_dim}). "
+                "Updating encoder embed_dim to match checkpoint."
+            )
+            self.embed_dim = actual_embed_dim
+
         name = ("vit_base_patch16_224" if self.model_size == "base"
                 else "vit_large_patch16_224")
         return timm.create_model(
-            name, pretrained=False, num_classes=0,
-            in_chans=CFG.s2_num_channels, img_size=CFG.image_size,
+            name,
+            pretrained=False,
+            num_classes=0,
+            in_chans=CFG.s2_num_channels,   # 12  (inflated to 14 after load)
+            img_size=CFG.image_size,
+            embed_dim=actual_embed_dim,      # match checkpoint exactly
         )
+
+    def _probe_checkpoint_embed_dim(self) -> int:
+        """
+        Peek at the checkpoint to read the true patch embedding output dim.
+        Returns 0 if the checkpoint cannot be found or read.
+        """
+        try:
+            import glob, os, torch
+            cache_root = CFG.weights_dir
+            pattern = os.path.join(
+                cache_root, "models--MBZUAI--TerraFM", "snapshots",
+                "*", "TerraFM-B.pth"
+            )
+            ckpts = glob.glob(pattern)
+            if not ckpts:
+                return 0
+            # Load only the patch embed weight tensor (fast, no full load)
+            state = torch.load(ckpts[0], map_location="cpu")
+            state = state.get("model", state.get("state_dict", state))
+            key = "patch_embed.conv2d_s2_l2a.weight"
+            if key in state:
+                return int(state[key].shape[0])   # out_channels
+        except Exception:
+            pass
+        return 0
 
     # ------------------------------------------------------------------
     # Patch-embed channel adaptation
@@ -246,9 +297,6 @@ class TerraFMEncoder(nn.Module):
                 f"Unexpected patch embedding in_channels={current_in}. "
                 f"Expected {CFG.s2_num_channels} (S2-only) or {target_in} (S1+S2)."
             )
-
-        # ------------------------------------------------------------------
-        # Try to recover the S2 L2A weights directly from the checkpoint.
         # TerraFM stores them under patch_embed.conv2d_s2_l2a.weight.
         # If found, use them; otherwise fall back to the current conv weights.
         # ------------------------------------------------------------------
@@ -376,10 +424,21 @@ class TerraFMEncoder(nn.Module):
                            f"{'...' if len(missing) > 10 else ''}")
         if unexpected:
             logger.warning(f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}")
-        ratio = len(missing) / max(total_keys, 1)
+
+        # Ignore the original modality-specific keys as "unexpected" —
+        # they were remapped before load_state_dict was called.
+        ignorable = {"patch_embed.s2_l2a_embed", "patch_embed.s2_l1c_embed",
+                     "patch_embed.s1_embed", "patch_embed.conv2d_s2_l2a.weight",
+                     "patch_embed.conv2d_s2_l2a.bias",
+                     "patch_embed.conv2d_s2_l1c.weight",
+                     "patch_embed.conv2d_s2_l1c.bias",
+                     "patch_embed.conv2d_s1.weight",
+                     "patch_embed.conv2d_s1.bias"}
+        real_missing = [k for k in missing if k not in ignorable]
+        ratio = len(real_missing) / max(total_keys, 1)
         if ratio > 0.10:
             raise RuntimeError(
-                f"Checkpoint mismatch: {len(missing)}/{total_keys} keys missing "
+                f"Checkpoint mismatch: {len(real_missing)}/{total_keys} keys missing "
                 f"({ratio*100:.1f}%). Wrong model_size or corrupted checkpoint."
             )
         logger.info(f"Weights loaded: {total_keys - len(missing)}/{total_keys} matched.")

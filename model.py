@@ -69,12 +69,18 @@ class TerraFMLULC(nn.Module):
         super().__init__()
         self.model_size  = model_size
         self.num_classes = num_classes
-        embed_dim        = 768 if model_size == "base" else 1024
 
+        # Build encoder first — it probes the checkpoint and sets its own
+        # embed_dim to the real value (2304 for TerraFM-B, not standard 768).
         self.encoder = TerraFMEncoder(
             model_size=model_size,
             freeze_stage=freeze_stage,
         )
+
+        # Read the true embed_dim from the encoder after it has loaded
+        # the checkpoint, so the decoder is sized correctly.
+        embed_dim = self.encoder.embed_dim
+
         self.decoder = UPerNetDecoder(
             in_channels=embed_dim,
             num_scales=len(CFG.vit_feature_indices),

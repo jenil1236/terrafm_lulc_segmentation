@@ -61,3 +61,33 @@ from visualize import BIGEARTHNET_CLASS_NAMES, BIGEARTHNET_COLORS
 CFG.class_names  = BIGEARTHNET_CLASS_NAMES
 CFG.class_colors = BIGEARTHNET_COLORS
 ```
+
+---
+
+## BUG 8 — TerraFM-B patch embedding output dim is 2304, not 768
+
+**File:** `terrafm_encoder.py` → `_build_bare_vit()`, `model.py` → `TerraFMLULC.__init__()`
+
+**Symptom:**
+```
+RuntimeError: size mismatch for patch_embed.proj.weight:
+  checkpoint shape: [2304, 12, 16, 16]
+  current model:    [ 768, 12, 16, 16]
+```
+
+**Root cause:** TerraFM-B fuses three modality-specific patch embeddings
+(S2-L2A, S2-L1C, S1) and concatenates their outputs before the transformer.
+The effective patch embedding output dimension is `768 × 3 = 2304`, not the
+standard ViT-B value of 768. The bare timm ViT scaffold was built with the
+standard `embed_dim=768`, causing the shape mismatch when the remapped
+`conv2d_s2_l2a.weight` (shape [2304, 12, 16, 16]) was loaded into it.
+
+**Fix:**
+1. `_build_bare_vit()` now calls `_probe_checkpoint_embed_dim()` which peeks
+   at the cached `.pth` file and reads the true output channels of
+   `conv2d_s2_l2a.weight`. It builds the timm ViT with
+   `embed_dim=actual_embed_dim` (2304) instead of hardcoding 768.
+2. `model.py` `TerraFMLULC.__init__()` now builds the encoder first, then
+   reads `self.encoder.embed_dim` (which was updated by the probe) and passes
+   that real value to the `UPerNetDecoder` constructor.
+3. `config.py` `vit_embed_dim` property updated to return 2304 for base.
