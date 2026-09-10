@@ -156,6 +156,8 @@ class DiceLoss(nn.Module):
         Returns:
             Scalar Dice loss.
         """
+        # Force float32 — Dice involves softmax+division which overflows in FP16
+        logits  = logits.float()
         num_classes = logits.shape[1]
         B, C, H, W = logits.shape
 
@@ -308,18 +310,34 @@ class SegmentationLoss(nn.Module):
                 mode="bilinear", align_corners=False
             )
 
+        # Always compute loss in float32 to avoid FP16 overflow/NaN
+        logits = logits.float()
+
         if self.loss_type == "ce":
-            return self.ce_loss(logits, targets)
+            loss = self.ce_loss(logits, targets)
 
         elif self.loss_type == "ce_dice":
-            ce = self.ce_loss(logits, targets)
+            ce   = self.ce_loss(logits, targets)
             dice = self.dice_loss(logits, targets)
-            return self.ce_w * ce + self.dice_w * dice
+            loss = self.ce_w * ce + self.dice_w * dice
 
         elif self.loss_type == "focal_dice":
             focal = self.focal_loss(logits, targets)
-            dice = self.dice_loss(logits, targets)
-            return self.ce_w * focal + self.dice_w * dice
+            dice  = self.dice_loss(logits, targets)
+            loss  = self.ce_w * focal + self.dice_w * dice
 
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
+
+        # Hard guard: if loss is NaN/Inf return zero so training can continue
+        # and log a warning so the issue is visible
+        if not torch.isfinite(loss):
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Non-finite loss detected ({loss.item()}). "
+                "Returning zero loss for this step. "
+                "Check for extreme logit values or bad batch."
+            )
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
+        return loss

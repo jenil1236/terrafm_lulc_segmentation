@@ -16,7 +16,7 @@ What this file does:
 
 What goes in:
     /content/data/file_clean.csv  (output of clean_dataset.py)
-    /content/data/S1/, S2/, selected_reference_map/
+    /content/data/S1/, S2/, reference_maps_selected/
 
 What comes out:
     outputs/splits/train.csv, val.csv, test.csv

@@ -166,6 +166,19 @@ class TerraFMEncoder(nn.Module):
             model = self._build_bare_vit()
             state = torch.load(ckpt_path, map_location="cpu")
             state = state.get("model", state.get("state_dict", state))
+
+            # TerraFM uses modality-specific patch embed keys.
+            # Remap conv2d_s2_l2a → patch_embed.proj so the timm ViT scaffold
+            # receives the correct pretrained S2 weights.
+            remap = {
+                "patch_embed.conv2d_s2_l2a.weight": "patch_embed.proj.weight",
+                "patch_embed.conv2d_s2_l2a.bias":   "patch_embed.proj.bias",
+            }
+            for src_key, dst_key in remap.items():
+                if src_key in state and dst_key not in state:
+                    state[dst_key] = state[src_key]
+                    logger.info(f"Remapped {src_key} → {dst_key}")
+
             result = model.load_state_dict(state, strict=False)
             self._verify_load(result, len(state))
             return model
@@ -194,20 +207,22 @@ class TerraFMEncoder(nn.Module):
 
     def _adapt_patch_embed(self, model: nn.Module) -> nn.Module:
         """
-        Ensure the patch embedding Conv2d accepts `self.in_channels` inputs.
+        Ensure the patch embedding Conv2d accepts `self.in_channels` (14) inputs.
 
-        Cases:
-          A) Model already has in_channels == 14  → no change needed.
-          B) Model has in_channels == 12 (S2-only) → inflate to 14.
-          C) Anything else → raise a clear error.
+        TerraFM-B uses modality-specific patch embeddings in its checkpoint:
+            patch_embed.conv2d_s2_l2a  (12-channel S2 L2A)
+            patch_embed.conv2d_s2_l1c  (12-channel S2 L1C)
+            patch_embed.conv2d_s1      ( 2-channel S1)
 
-        Weight inflation strategy for case B:
-          new[:, :12, :, :] = old             (preserve S2 pretrained weights)
-          new[:, 12:14, :, :] = mean(old) × 2 (init S1 channels at avg scale)
-          Multiplying by 2 compensates for the fact that mean(old) across 12
-          channels would otherwise give an effective scale of 12/14 ≈ 0.86
-          of the original mean response.  ×2 is a deliberate slight over-
-          initialisation that the fine-tuning will quickly correct.
+        The timm ViT scaffold (used as fallback) has a standard
+        patch_embed.proj Conv2d. We need to:
+          1. Load conv2d_s2_l2a weights from the checkpoint into patch_embed.proj
+          2. Inflate from 12 → 14 channels (adding S1 channels)
+
+        Cases handled:
+          A) model already has in_channels == 14  → no change.
+          B) model has in_channels == 12          → inflate to 14.
+          C) model has in_channels == anything else → raise.
         """
         conv = self._find_patch_embed_conv(model)
         if conv is None:
@@ -222,44 +237,79 @@ class TerraFMEncoder(nn.Module):
 
         if current_in == target_in:
             logger.info(
-                f"Patch embedding already has {current_in} input channels – "
-                "no adaptation needed."
+                f"Patch embedding already has {current_in} input channels."
             )
             return model
 
-        if current_in == CFG.s2_num_channels:   # 12
-            logger.info(
-                f"Inflating patch embedding from {current_in} → {target_in} channels "
-                "(S2 weights preserved, S1 channels initialised from S2 mean)"
+        if current_in != CFG.s2_num_channels:   # not 12
+            raise RuntimeError(
+                f"Unexpected patch embedding in_channels={current_in}. "
+                f"Expected {CFG.s2_num_channels} (S2-only) or {target_in} (S1+S2)."
             )
-            old_w = conv.weight.data           # [out, 12, ph, pw]
-            old_b = conv.bias.data if conv.bias is not None else None
 
-            new_conv = nn.Conv2d(
-                target_in, conv.out_channels,
-                kernel_size=conv.kernel_size,
-                stride=conv.stride,
-                padding=conv.padding,
-                bias=(conv.bias is not None),
+        # ------------------------------------------------------------------
+        # Try to recover the S2 L2A weights directly from the checkpoint.
+        # TerraFM stores them under patch_embed.conv2d_s2_l2a.weight.
+        # If found, use them; otherwise fall back to the current conv weights.
+        # ------------------------------------------------------------------
+        s2_weight = conv.weight.data   # [out, 12, ph, pw] — may be random if
+                                        # the checkpoint keys didn't match
+
+        # Look in the backbone's state_dict for the TerraFM-specific key
+        sd = {k: v for k, v in self.backbone.state_dict().items()}
+        terrafm_key = "patch_embed.conv2d_s2_l2a.weight"
+        if terrafm_key not in sd:
+            # Also try without the patch_embed prefix
+            for k in sd:
+                if "conv2d_s2_l2a.weight" in k:
+                    terrafm_key = k
+                    break
+
+        if terrafm_key in sd:
+            candidate = sd[terrafm_key]   # [out, 12, ph, pw]
+            if candidate.shape == s2_weight.shape:
+                s2_weight = candidate.clone()
+                logger.info(
+                    "Using TerraFM conv2d_s2_l2a weights for patch embedding "
+                    "(correct pretrained S2 L2A weights loaded)."
+                )
+            else:
+                logger.warning(
+                    f"conv2d_s2_l2a shape {candidate.shape} != "
+                    f"expected {s2_weight.shape}. Using current weights."
+                )
+        else:
+            logger.warning(
+                "patch_embed.conv2d_s2_l2a.weight not found in backbone state. "
+                "Patch embedding will use random weights for S2 channels."
             )
-            with torch.no_grad():
-                new_conv.weight[:, :current_in, :, :] = old_w
-                # S1 channels: mean of S2 weights × 2
-                s1_init = old_w.mean(dim=1, keepdim=True).expand(
-                    -1, target_in - current_in, -1, -1
-                ) * 2.0
-                new_conv.weight[:, current_in:, :, :] = s1_init
-                if old_b is not None:
-                    new_conv.bias.copy_(old_b)
 
-            self._set_patch_embed_conv(model, new_conv)
-            return model
-
-        raise RuntimeError(
-            f"Unexpected patch embedding in_channels={current_in}. "
-            f"Expected {CFG.s2_num_channels} (S2-only) or {target_in} (S1+S2). "
-            "Cannot safely adapt weights. Check model_size and TerraFM version."
+        logger.info(
+            f"Inflating patch embedding from {current_in} → {target_in} channels "
+            "(S2 L2A weights preserved, S1 channels initialised from S2 mean)"
         )
+
+        old_b = conv.bias.data if conv.bias is not None else None
+
+        new_conv = nn.Conv2d(
+            target_in, conv.out_channels,
+            kernel_size=conv.kernel_size,
+            stride=conv.stride,
+            padding=conv.padding,
+            bias=(conv.bias is not None),
+        )
+        with torch.no_grad():
+            new_conv.weight[:, :current_in, :, :] = s2_weight
+            # S1 channels: mean of S2 weights × 2 for a reasonable init
+            s1_init = s2_weight.mean(dim=1, keepdim=True).expand(
+                -1, target_in - current_in, -1, -1
+            ) * 2.0
+            new_conv.weight[:, current_in:, :, :] = s1_init
+            if old_b is not None:
+                new_conv.bias.copy_(old_b)
+
+        self._set_patch_embed_conv(model, new_conv)
+        return model
 
     def _find_patch_embed_conv(self, model: nn.Module) -> Optional[nn.Conv2d]:
         """Locate the patch-embedding Conv2d regardless of model class."""

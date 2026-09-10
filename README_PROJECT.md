@@ -71,7 +71,7 @@ S1B_IW_GRDH_..._33UUP_37_89,S2A_MSIL2A_..._33UUP_37_89,S2A_MSIL2A_..._33UUP_37_8
 
 - `s1_name` → folder name inside `S1/`
 - `patch_id` → folder name inside `S2/`
-- `reference_map_id` → file stem in `selected_reference_map/` (`.tif` appended)
+- `reference_map_id` → file stem in `reference_maps_selected/` (`.tif` appended)
 
 ---
 
@@ -84,7 +84,7 @@ python clean_dataset.py \
     --csv  /content/data/file.csv \
     --s1   /content/data/S1 \
     --s2   /content/data/S2 \
-    --ref  /content/data/selected_reference_map \
+    --ref  /content/data/reference_maps_selected \
     --out_csv  /content/data/file_clean.csv \
     --log  /content/outputs/corrupted_patches.txt
 ```
@@ -295,3 +295,87 @@ The model takes a 14-channel image (12 spectral bands from Sentinel-2 + 2 SAR
 bands from Sentinel-1), feeds it through a pretrained vision transformer
 (TerraFM), and uses the extracted features to predict a land-cover class for
 every pixel.
+
+---
+
+## Correct Dataset Paths
+
+After extracting `dataset.zip`, the folder structure is:
+
+```
+/content/
+└── content/
+    └── dataset/
+        ├── images/
+        │   ├── S1/
+        │   ├── S2/
+        │   └── reference_maps_selected/
+        └── file_clean.csv
+```
+
+These paths are already set correctly in Cell 3 of the notebook.
+
+---
+
+## Notebook Cell Order (Updated)
+
+| Cell | Action | Re-run every session? |
+|------|--------|-----------------------|
+| 1 | Install dependencies | ✅ Yes |
+| 2 | Clone repo from GitHub | ✅ Yes |
+| 3 | Configure paths + CFG + BigEarthNet names | ✅ Yes |
+| 4 | Download dataset with gdown | Only if not extracted |
+| 5 | Verify reference map (visual) | Optional |
+| 6 | Verify S2+S1 tensor shapes | Optional |
+| 7 | Prepare splits + norm stats + class stats | **Once only** |
+| 8 | Reload saved stats | ✅ Yes (skip Cell 7 after first run) |
+| 9 | Visualize training examples | Optional |
+| 10 | Phase 0 smoke test | Before first full training |
+| 11 | Phase 1 pilot | Optional |
+| 12 | Phase 2 full training | Set RESUME_FROM to continue |
+| 13 | Evaluate test set | After training |
+| 14 | Plot training curves | After training |
+| 15 | Export final model | After training |
+| 16 | Inference on new patch | After export |
+
+---
+
+## Session Resume Guide
+
+### What to download before session ends
+
+| Phase | File | Why needed |
+|-------|------|------------|
+| After Cell 7 | `outputs/splits/train.csv`, `val.csv`, `test.csv` | Reproducible split — avoid re-running 10 min prep |
+| After Cell 7 | `outputs/norm_stats.json` | S2+S1 stats must be identical across sessions |
+| After Cell 7 | `outputs/class_mapping.json` + `class_stats.json` | Class IDs + loss weights |
+| During Phase 2 | `outputs/checkpoints/last_checkpoint.pth` | Resume training from exact epoch |
+| After training | `outputs/checkpoints/best_model.pth` | Best weights |
+| After Cell 15 | `outputs/terrafm_lulc_model.pth` | Self-contained inference artifact |
+
+### How to resume in a new session
+
+1. Run Cells 1, 2, 3 (always required — installs, clones, sets paths)
+2. Upload your saved files to `/content/outputs/` via the Colab file browser
+3. Skip Cell 7 → run **Cell 8** to reload stats from uploaded files
+4. Phase 2 resume — in Cell 12 set:
+   ```python
+   RESUME_FROM = '/content/outputs/checkpoints/last_checkpoint.pth'
+   ```
+   Then run Cell 12. Training continues from the last saved epoch, with the same optimizer and scheduler state.
+
+---
+
+## Known Bugs Fixed
+
+See `BUGLOG.md` for full details.
+
+| # | Bug | Fix |
+|---|-----|-----|
+| 1 | GT mask all black | uint8 overflow for CLC IDs > 255 → changed to uint32 |
+| 2 | Train loss = NaN | FP16 overflow in Dice loss → cast logits to float32 before loss |
+| 3 | Patch embedding not loaded | TerraFM uses `conv2d_s2_l2a` key, not standard `proj` → key remapping added |
+| 4 | Wrong colors in visualization | matplotlib vmin/vmax clipped -1 to red → replaced with direct uint8 LUT |
+| 5 | Duplicate functions in visualize.py | Full rewrite of the file |
+| 6 | Wrong data paths in notebook | Updated to match actual zip extraction structure |
+| 7 | Legend showed `class_0` etc. | Added BigEarthNet names assignment in Cell 3 |

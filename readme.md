@@ -144,7 +144,7 @@ content/
     │
     ├── file.csv
     │
-    └── selected_reference_map/
+    └── reference_maps_selected/
         ├── PATCH_ID_001.tif
         ├── PATCH_ID_002.tif
         └── ...

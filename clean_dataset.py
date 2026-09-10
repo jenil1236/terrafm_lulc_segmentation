@@ -10,7 +10,7 @@ What this file does:
         1. Logged to  corrupted_patches.txt  (with reason and count).
         2. Removed from file.csv  →  file_clean.csv  is written.
         3. Their on-disk folders/files are deleted from S1/ and S2/
-           and the reference map TIFF is deleted from selected_reference_map/.
+           and the reference map TIFF is deleted from reference_maps_selected/.
 
 Usage (from Colab or terminal):
     python clean_dataset.py
@@ -20,7 +20,7 @@ Usage (from Colab or terminal):
         --csv  /content/data/file.csv \
         --s1   /content/data/S1 \
         --s2   /content/data/S2 \
-        --ref  /content/data/selected_reference_map \
+        --ref  /content/data/reference_maps_selected \
         --out_csv    /content/data/file_clean.csv \
         --log        /content/outputs/corrupted_patches.txt
 
@@ -28,7 +28,7 @@ What goes in:
     file.csv with columns:  s1_name, patch_id, reference_map_id
     S1/  directory tree
     S2/  directory tree
-    selected_reference_map/ directory
+    reference_maps_selected/ directory
 
 What comes out:
     file_clean.csv           – cleaned CSV (use this for all training)
@@ -68,7 +68,7 @@ from tqdm import tqdm
 DEFAULT_CSV = "/content/data/file.csv"
 DEFAULT_S1  = "/content/data/S1"
 DEFAULT_S2  = "/content/data/S2"
-DEFAULT_REF = "/content/data/selected_reference_map"
+DEFAULT_REF = "/content/data/reference_maps_selected"
 DEFAULT_OUT_CSV = "/content/data/file_clean.csv"
 DEFAULT_LOG = "/content/outputs/corrupted_patches.txt"
 

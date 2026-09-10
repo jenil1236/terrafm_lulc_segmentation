@@ -44,7 +44,7 @@ class Config:
     data_root: str = "/content/data"
     s2_dir: str = "/content/data/S2"
     s1_dir: str = "/content/data/S1"
-    ref_dir: str = "/content/data/selected_reference_map"
+    ref_dir: str = "/content/data/reference_maps_selected"
     csv_file: str = "/content/data/file.csv"
     output_dir: str = "/content/outputs"
     checkpoint_dir: str = "/content/outputs/checkpoints"
