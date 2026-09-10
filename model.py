@@ -70,8 +70,8 @@ class TerraFMLULC(nn.Module):
         self.model_size  = model_size
         self.num_classes = num_classes
 
-        # Build encoder first — it probes the checkpoint and sets its own
-        # embed_dim to the real value (2304 for TerraFM-B, not standard 768).
+        # Build encoder first — it loads TerraFM via the official terrafm.py
+        # and sets embed_dim = 768 (ViT-B) or 1024 (ViT-L).
         self.encoder = TerraFMEncoder(
             model_size=model_size,
             freeze_stage=freeze_stage,

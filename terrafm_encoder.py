@@ -4,48 +4,36 @@ terrafm_encoder.py
 TerraFM pretrained encoder wrapper for S1+S2 semantic segmentation.
 
 What this file does:
-    Loads TerraFM (ViT-B or ViT-L) from HuggingFace (MBZUAI/TerraFM),
-    adapts its patch embedding to accept 14-channel fused S1+S2 input,
-    extracts multi-scale spatial feature maps from intermediate ViT blocks,
-    and manages freeze/unfreeze stages.
+    Loads TerraFM-B/L from the HuggingFace snapshot using the official
+    terrafm.py class definition (TerraFM / terrafm_base / terrafm_large).
+    Handles S1+S2 fused input by routing each modality through its correct
+    patch embedding branch, then fusing before the transformer.
+    Extracts multi-scale spatial features from intermediate ViT blocks.
 
 What goes in:
-    - Fused tensor [B, 14, 224, 224]  (12 S2 + 2 S1 channels, normalized)
+    - Fused tensor [B, 14, 224, 224]  (first 12 = S2, last 2 = S1)
 
 What comes out:
     - List of 4 feature maps, each [B, embed_dim, 14, 14]
-      (patch grid = 224/16 = 14 per side; embed_dim = 768 for ViT-B)
+      (embed_dim = 768 for TerraFM-B, 1024 for TerraFM-L)
 
-How it connects:
-    model.py wraps TerraFMEncoder + UPerNetDecoder into TerraFMLULC.
-
-14-CHANNEL INPUT STRATEGY:
--------------------------------------------------------------------
-TerraFM's pretrained patch embedding was trained on modality-specific
-inputs.  When we fuse S2 (12ch) + S1 (2ch) into a single 14-channel
-tensor we need to expand the embedding's input projection.
-
-CONFIRMED from TerraFM checkpoint keys:
-  - TerraFM-B transformer embed_dim = 768   (blocks.0.norm1.weight shape [768])
-  - patch_embed.conv2d_s2_l2a.weight shape [2304, 12, 16, 16]
-    → out_channels = 2304 is the patch embed output (NOT the transformer dim)
-    → the official class projects 2304 → 768 internally
-  - The official terrafm.py class must be loaded from the snapshot so that
-    all modality-specific projections and cross-attention fusion are intact.
-
-LOADING STRATEGY:
-  1. Download snapshot (or use cached copy).
-  2. Import terrafm.py from snapshot via importlib.
-  3. Instantiate the official TerraFM class.
-  4. Load checkpoint into that class with strict=False.
-  5. Detect actual embed_dim from blocks.0.norm1.weight shape (= 768).
-  6. Inflate patch embedding input channels from 12 → 14.
--------------------------------------------------------------------
+CONFIRMED from official terrafm.py:
+    - TerraFM(embed_dim=768) → standard ViT-B transformer at 768-dim
+    - PatchEmbed routes by channel count:
+        C == 2  → conv2d_s1  → 2304-dim tokens (NO projection)
+        is_l2a  → conv2d_s2_l2a → 2304-dim → TokenProjection → 768-dim
+        else    → conv2d_s2_l1c → 2304-dim → TokenProjection → 768-dim
+    - Our fused [14, H, W] tensor is split: s2=[12ch], s1=[2ch]
+    - We embed each separately, add them, then run the transformer.
+    - get_intermediate_layers(x, n) returns the LAST n blocks' outputs.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import logging
+import os
+from functools import partial
 from typing import List, Optional
 
 import torch
@@ -58,435 +46,137 @@ logger = logging.getLogger(__name__)
 
 class TerraFMEncoder(nn.Module):
     """
-    TerraFM backbone wrapper that accepts 14-channel S1+S2 fused input.
+    TerraFM backbone wrapper for fused S1+S2 input [B, 14, H, W].
+
+    Splits the fused tensor into S2 (ch 0:12) and S1 (ch 12:14),
+    embeds each through the correct PatchEmbed branch, sums them,
+    then runs the full ViT transformer.
 
     Args:
-        model_size:   "base" (ViT-B, 768-dim) or "large" (ViT-L, 1024-dim).
+        model_size:   "base" (embed_dim=768) or "large" (embed_dim=1024).
         freeze_stage: 0=freeze all, 1=partial, 2=unfreeze all.
     """
 
     def __init__(self, model_size: str = "base", freeze_stage: int = 0):
         super().__init__()
-        self.model_size        = model_size
-        # Default embed_dim; will be overridden by checkpoint detection at load time
-        self.embed_dim         = 768 if model_size == "base" else 1024
-        self.num_blocks        = 12  if model_size == "base" else 24
-        self.feature_indices   = (
+        self.model_size       = model_size
+        self.embed_dim        = 768 if model_size == "base" else 1024
+        self.num_blocks       = 12  if model_size == "base" else 24
+        self.feature_indices  = (
             CFG.vit_feature_indices_base  if model_size == "base"
             else CFG.vit_feature_indices_large
         )
-        self.patch_size        = CFG.patch_size
-        self.image_size        = CFG.image_size
-        self.num_patches_side  = self.image_size // self.patch_size  # 14
-        self.in_channels       = CFG.total_in_channels               # 14
+        self.patch_size       = CFG.patch_size
+        self.image_size       = CFG.image_size
+        self.num_patches_side = self.image_size // self.patch_size  # 14
 
-        # Load backbone and adapt to 14 channels
+        # Load official TerraFM model
         self.backbone = self._load_terrafm()
 
-        # Apply freeze strategy
+        # Apply initial freeze
         self.set_freeze_stage(freeze_stage)
 
-        # Choose feature extraction method
-        self._use_timm_api = hasattr(self.backbone, "get_intermediate_layers")
-        if not self._use_timm_api:
-            self._hook_outputs: List = [None] * len(self.feature_indices)
-            self._hooks: List        = []
-            self._register_hooks()
-            logger.info("TerraFM: using forward hooks for feature extraction")
-        else:
-            logger.info("TerraFM: using get_intermediate_layers() for feature extraction")
+        logger.info("TerraFM: using custom forward with S1+S2 split")
 
     # ------------------------------------------------------------------
-    # Model loading
+    # Loading
     # ------------------------------------------------------------------
 
     def _load_terrafm(self) -> nn.Module:
         logger.info(f"Loading TerraFM-{self.model_size} from {CFG.terrafm_hub_id}")
-        backbone = self._try_load_huggingface()
+        backbone = self._load_from_snapshot()
         if backbone is None:
             raise RuntimeError(
-                "Failed to load TerraFM from any source.\n"
+                "Failed to load TerraFM.\n"
                 f"  Hub ID: {CFG.terrafm_hub_id}\n"
-                "  Ensure HuggingFace Hub is reachable and "
-                "'transformers'/'timm' are installed."
+                "  Ensure HuggingFace Hub is reachable."
             )
-        # Adapt the patch embedding to accept 14 channels
-        backbone = self._adapt_patch_embed(backbone)
         return backbone
 
-    def _try_load_huggingface(self) -> Optional[nn.Module]:
-        # ----------------------------------------------------------------
-        # APPROACH 1: Use terrafm.py from snapshot (authoritative)
-        # ----------------------------------------------------------------
+    def _load_from_snapshot(self) -> Optional[nn.Module]:
+        """
+        Download (or use cached) snapshot, import terrafm.py,
+        instantiate TerraFM via the terrafm_base / terrafm_large factory,
+        load weights with strict=False.
+        """
         try:
             import glob
-            import os
-            import importlib.util
             from huggingface_hub import snapshot_download
 
             local_dir = snapshot_download(
                 repo_id=CFG.terrafm_hub_id,
                 cache_dir=CFG.weights_dir,
             )
-            logger.info(f"TerraFM snapshot: {local_dir}")
+            logger.info(f"Snapshot: {local_dir}")
             logger.info(f"Files: {sorted(os.listdir(local_dir))}")
 
-            # Find terrafm.py
+            # Import terrafm.py dynamically
             terrafm_py = os.path.join(local_dir, "terrafm.py")
             if not os.path.exists(terrafm_py):
-                raise FileNotFoundError(f"terrafm.py not in {local_dir}")
+                raise FileNotFoundError(f"terrafm.py not found in {local_dir}")
 
-            # Import it dynamically
-            spec = importlib.util.spec_from_file_location("terrafm_official", terrafm_py)
+            spec   = importlib.util.spec_from_file_location("terrafm_official", terrafm_py)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
 
-            # Find checkpoint (.pth or .pt)
+            # Instantiate using the official factory function
+            # terrafm_base() → TerraFM(embed_dim=768, depth=12, num_heads=12, ...)
+            if self.model_size == "base":
+                model = module.terrafm_base(patch_size=self.patch_size)
+            else:
+                model = module.terrafm_large(patch_size=self.patch_size)
+
+            logger.info(f"Instantiated via terrafm_{self.model_size}()")
+
+            # Find checkpoint
             ckpts = sorted(
                 glob.glob(os.path.join(local_dir, "*.pth")) +
                 glob.glob(os.path.join(local_dir, "*.pt"))
             )
             if not ckpts:
                 raise FileNotFoundError(f"No .pth/.pt in {local_dir}")
-            ckpt_path = ckpts[0]
-            logger.info(f"Checkpoint: {ckpt_path}")
 
+            # Pick the right checkpoint for the model size
+            ckpt_path = ckpts[0]
+            for c in ckpts:
+                if self.model_size == "base" and "B" in os.path.basename(c).upper():
+                    ckpt_path = c
+                    break
+                if self.model_size == "large" and "L" in os.path.basename(c).upper():
+                    ckpt_path = c
+                    break
+
+            logger.info(f"Loading checkpoint: {ckpt_path}")
             state = torch.load(ckpt_path, map_location="cpu")
             state = state.get("model", state.get("state_dict", state))
 
-            # Detect true transformer embed_dim from block norm weights
-            # (= 768 for TerraFM-B, NOT 2304 which is the patch embed output)
-            for k, v in state.items():
-                if "blocks.0.norm1.weight" in k:
-                    self.embed_dim = int(v.shape[0])
-                    logger.info(f"Detected transformer embed_dim={self.embed_dim} "
-                                f"from {k} shape {list(v.shape)}")
-                    break
-
-            # Instantiate official model from terrafm.py
-            model = self._instantiate_from_module(module, state)
-
             result = model.load_state_dict(state, strict=False)
-            self._verify_load(result, len(state))
-            logger.info("TerraFM loaded via official terrafm.py")
+            self._log_load_result(result, len(state))
             self._log_model_info(model)
             return model
 
-        except Exception as e1:
-            logger.warning(f"terrafm.py approach failed: {e1}")
+        except Exception as e:
+            logger.error(f"Snapshot load failed: {e}")
+            return None
 
-        # ----------------------------------------------------------------
-        # APPROACH 2: AutoModel with trust_remote_code
-        # ----------------------------------------------------------------
-        try:
-            from transformers import AutoModel
-            model = AutoModel.from_pretrained(
-                CFG.terrafm_hub_id,
-                trust_remote_code=True,
-                cache_dir=CFG.weights_dir,
-            )
-            self._detect_embed_dim_from_model(model)
-            logger.info("TerraFM loaded via AutoModel")
-            self._log_model_info(model)
-            return model
-        except Exception as e2:
-            logger.warning(f"AutoModel failed: {e2}")
-
-        return None
-
-    def _instantiate_from_module(self, module, state: dict) -> nn.Module:
-        """Try all common factory patterns found in terrafm.py."""
-        # Try known class names and factory functions
-        for name in [
-            "TerraFM", "TerraFMBase", "TerraFMLarge",
-            "build_terrafm", "build_model", "create_model",
-            "terrafm_base", "terrafm_large",
-        ]:
-            obj = getattr(module, name, None)
-            if obj is None:
-                continue
-            for kwargs in [
-                {"size": "base"}, {"model_size": "base"}, {"variant": "base"},
-                {"pretrained": False}, {},
-            ]:
-                try:
-                    if isinstance(obj, type) and issubclass(obj, nn.Module):
-                        m = obj(**kwargs) if kwargs else obj()
-                    else:
-                        m = obj(**kwargs) if kwargs else obj()
-                    if isinstance(m, nn.Module):
-                        logger.info(f"Instantiated via {name}({kwargs})")
-                        return m
-                except Exception:
-                    continue
-
-        # Fallback: scan for any nn.Module subclass in the module
-        for name in sorted(dir(module)):
-            if name.startswith("_"):
-                continue
-            obj = getattr(module, name)
-            if (
-                isinstance(obj, type)
-                and issubclass(obj, nn.Module)
-                and obj is not nn.Module
-            ):
-                try:
-                    m = obj()
-                    if isinstance(m, nn.Module):
-                        logger.info(f"Instantiated via {name}()")
-                        return m
-                except Exception:
-                    pass
-
-        raise RuntimeError(
-            f"Cannot instantiate model from terrafm.py. "
-            f"Names: {[n for n in dir(module) if not n.startswith('_')]}"
-        )
-
-    def _detect_embed_dim_from_model(self, model: nn.Module) -> None:
-        """Read actual embed_dim from loaded model parameters."""
-        for name, param in model.named_parameters():
-            if "blocks.0.norm1.weight" in name or "layer.0" in name:
-                self.embed_dim = int(param.shape[0])
-                logger.info(
-                    f"Detected embed_dim={self.embed_dim} from {name}"
-                )
-                return
-
-    # ------------------------------------------------------------------
-    # Patch-embed channel adaptation
-    # ------------------------------------------------------------------
-
-    def _adapt_patch_embed(self, model: nn.Module) -> nn.Module:
-        """
-        Ensure the patch embedding Conv2d accepts `self.in_channels` (14) inputs.
-
-        TerraFM-B uses modality-specific patch embeddings in its checkpoint:
-            patch_embed.conv2d_s2_l2a  (12-channel S2 L2A)
-            patch_embed.conv2d_s2_l1c  (12-channel S2 L1C)
-            patch_embed.conv2d_s1      ( 2-channel S1)
-
-        Cases handled:
-          A) model already has in_channels == 14  → no change.
-          B) model has in_channels == 12          → inflate to 14.
-          C) model has in_channels == anything else → raise.
-        """
-        conv = self._find_patch_embed_conv(model)
-        if conv is None:
-            logger.warning(
-                "Could not locate patch embedding Conv2d. "
-                "Assuming model already handles 14-channel input."
-            )
-            return model
-
-        current_in = conv.in_channels
-        target_in  = self.in_channels   # 14
-
-        if current_in == target_in:
-            logger.info(
-                f"Patch embedding already has {current_in} input channels."
-            )
-            return model
-
-        if current_in != CFG.s2_num_channels:   # not 12
-            raise RuntimeError(
-                f"Unexpected patch embedding in_channels={current_in}. "
-                f"Expected {CFG.s2_num_channels} (S2-only) or {target_in} (S1+S2)."
-            )
-
-        # TerraFM stores pretrained S2 L2A weights under conv2d_s2_l2a.weight.
-        # Use them if available; otherwise fall back to current conv weights.
-        s2_weight = conv.weight.data   # [out, 12, ph, pw]
-
-        sd = dict(model.state_dict())
-        terrafm_key = "patch_embed.conv2d_s2_l2a.weight"
-        if terrafm_key not in sd:
-            for k in sd:
-                if "conv2d_s2_l2a.weight" in k:
-                    terrafm_key = k
-                    break
-
-        if terrafm_key in sd:
-            candidate = sd[terrafm_key]
-            if candidate.shape == s2_weight.shape:
-                s2_weight = candidate.clone()
-                logger.info(
-                    "Using TerraFM conv2d_s2_l2a weights for patch embedding "
-                    "(correct pretrained S2 L2A weights loaded)."
-                )
-            else:
-                logger.warning(
-                    f"conv2d_s2_l2a shape {list(candidate.shape)} != "
-                    f"expected {list(s2_weight.shape)}. Using current weights."
-                )
-        else:
-            logger.warning(
-                "patch_embed.conv2d_s2_l2a.weight not found in backbone state. "
-                "Patch embedding will use random weights for S2 channels."
-            )
-
-        logger.info(
-            f"Inflating patch embedding from {current_in} → {target_in} channels "
-            "(S2 L2A weights preserved, S1 channels initialised from S2 mean)"
-        )
-
-        old_b = conv.bias.data if conv.bias is not None else None
-
-        new_conv = nn.Conv2d(
-            target_in, conv.out_channels,
-            kernel_size=conv.kernel_size,
-            stride=conv.stride,
-            padding=conv.padding,
-            bias=(conv.bias is not None),
-        )
-        with torch.no_grad():
-            new_conv.weight[:, :current_in, :, :] = s2_weight
-            # S1 channels: mean of S2 weights × 2 for a sensible init
-            s1_init = s2_weight.mean(dim=1, keepdim=True).expand(
-                -1, target_in - current_in, -1, -1
-            ) * 2.0
-            new_conv.weight[:, current_in:, :, :] = s1_init
-            if old_b is not None:
-                new_conv.bias.copy_(old_b)
-
-        self._set_patch_embed_conv(model, new_conv)
-        return model
-
-    def _find_patch_embed_conv(self, model: nn.Module) -> Optional[nn.Conv2d]:
-        """Locate the patch-embedding Conv2d regardless of model class."""
-        # timm ViT: model.patch_embed.proj
-        if hasattr(model, "patch_embed") and hasattr(model.patch_embed, "proj"):
-            c = model.patch_embed.proj
-            if isinstance(c, nn.Conv2d):
-                return c
-        # HuggingFace ViT: model.embeddings.patch_embeddings.projection
-        for path in [
-            ["embeddings", "patch_embeddings", "projection"],
-            ["vit", "embeddings", "patch_embeddings", "projection"],
-        ]:
-            obj = model
-            try:
-                for attr in path:
-                    obj = getattr(obj, attr)
-                if isinstance(obj, nn.Conv2d):
-                    return obj
-            except AttributeError:
-                continue
-        # Generic search: first Conv2d with "patch" in its module path
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Conv2d) and "patch" in name.lower():
-                return module
-        return None
-
-    def _set_patch_embed_conv(self, model: nn.Module, new_conv: nn.Conv2d) -> None:
-        """Replace the patch-embedding Conv2d in-place."""
-        if hasattr(model, "patch_embed") and hasattr(model.patch_embed, "proj"):
-            model.patch_embed.proj = new_conv
-            return
-        for path in [
-            ["embeddings", "patch_embeddings"],
-            ["vit", "embeddings", "patch_embeddings"],
-        ]:
-            obj = model
-            try:
-                for attr in path:
-                    obj = getattr(obj, attr)
-                obj.projection = new_conv
-                return
-            except AttributeError:
-                continue
-        logger.error(
-            "Could not replace patch embedding Conv2d. "
-            "The encoder may still use the old 12-channel embedding."
-        )
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _log_model_info(self, model: nn.Module) -> None:
-        total     = sum(p.numel() for p in model.parameters()) / 1e6
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
-        logger.info(f"  TerraFM params: {total:.1f}M total / {trainable:.1f}M trainable")
-
-    def _verify_load(self, result, total_keys: int) -> None:
+    def _log_load_result(self, result, total_keys: int) -> None:
         missing    = result.missing_keys
         unexpected = result.unexpected_keys
         if missing:
-            logger.warning(
-                f"Missing keys ({len(missing)}): {missing[:10]}"
-                f"{'...' if len(missing) > 10 else ''}"
-            )
+            logger.warning(f"Missing keys ({len(missing)}): {missing[:5]}")
         if unexpected:
-            logger.warning(
-                f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}"
-            )
-
-        # Modality-specific patch embed keys are expected to be "unexpected"
-        # when loading into an official TerraFM class — that class handles
-        # them internally.  Exclude them from the mismatch ratio check.
-        ignorable = {
-            "patch_embed.s2_l2a_embed",
-            "patch_embed.s2_l1c_embed",
-            "patch_embed.s1_embed",
-            "patch_embed.conv2d_s2_l2a.weight",
-            "patch_embed.conv2d_s2_l2a.bias",
-            "patch_embed.conv2d_s2_l1c.weight",
-            "patch_embed.conv2d_s2_l1c.bias",
-            "patch_embed.conv2d_s1.weight",
-            "patch_embed.conv2d_s1.bias",
-        }
-        real_missing = [k for k in missing if k not in ignorable]
-        ratio = len(real_missing) / max(total_keys, 1)
+            logger.warning(f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+        ratio = len(missing) / max(total_keys, 1)
         if ratio > 0.10:
             raise RuntimeError(
-                f"Checkpoint mismatch: {len(real_missing)}/{total_keys} keys missing "
-                f"({ratio*100:.1f}%). Wrong model_size or corrupted checkpoint."
+                f"Too many missing keys: {len(missing)}/{total_keys} "
+                f"({ratio*100:.1f}%). Wrong checkpoint or model_size."
             )
-        logger.info(
-            f"Weights loaded: {total_keys - len(missing)}/{total_keys} matched."
-        )
+        logger.info(f"Weights: {total_keys - len(missing)}/{total_keys} matched.")
 
-    # ------------------------------------------------------------------
-    # Hooks (fallback feature extraction)
-    # ------------------------------------------------------------------
-
-    def _register_hooks(self) -> None:
-        for h in self._hooks:
-            h.remove()
-        self._hooks.clear()
-        self._hook_outputs = [None] * len(self.feature_indices)
-
-        blocks = self._get_vit_blocks()
-        if blocks is None:
-            logger.error("Cannot find ViT transformer blocks for hook registration.")
-            return
-
-        for slot, block_idx in enumerate(self.feature_indices):
-            if block_idx < len(blocks):
-                def make_hook(s):
-                    def hook(module, inp, output):
-                        if isinstance(output, torch.Tensor):
-                            self._hook_outputs[s] = output
-                        elif hasattr(output, "last_hidden_state"):
-                            self._hook_outputs[s] = output.last_hidden_state
-                        else:
-                            self._hook_outputs[s] = output[0]
-                    return hook
-                self._hooks.append(
-                    blocks[block_idx].register_forward_hook(make_hook(slot))
-                )
-
-    def _get_vit_blocks(self):
-        if hasattr(self.backbone, "blocks"):
-            return self.backbone.blocks
-        if hasattr(self.backbone, "encoder") and hasattr(self.backbone.encoder, "layer"):
-            return self.backbone.encoder.layer
-        if hasattr(self.backbone, "vit"):
-            enc = getattr(self.backbone.vit, "encoder", None)
-            if enc and hasattr(enc, "layer"):
-                return enc.layer
-        return None
+    def _log_model_info(self, model: nn.Module) -> None:
+        total = sum(p.numel() for p in model.parameters()) / 1e6
+        logger.info(f"  TerraFM params: {total:.1f}M")
 
     # ------------------------------------------------------------------
     # Freeze / unfreeze
@@ -494,46 +184,37 @@ class TerraFMEncoder(nn.Module):
 
     def set_freeze_stage(self, stage: int) -> None:
         """
-        Stage 0: Freeze entire encoder (decoder-only training).
-        Stage 1: Freeze all except the last N transformer blocks + patch embed.
+        Stage 0: Freeze everything (decoder-only training).
+        Stage 1: Freeze all except last N blocks + patch embed.
         Stage 2: Unfreeze everything.
         """
         if stage == 0:
             for p in self.backbone.parameters():
                 p.requires_grad = False
-            logger.info("TerraFM encoder: ALL frozen (Stage 0)")
+            logger.info("TerraFM: ALL frozen (Stage 0)")
 
         elif stage == 1:
             for p in self.backbone.parameters():
                 p.requires_grad = False
-            blocks = self._get_vit_blocks()
-            if blocks is not None:
-                n = CFG.unfreeze_last_n_blocks
-                for blk in blocks[-n:]:
-                    for p in blk.parameters():
-                        p.requires_grad = True
-                logger.info(
-                    f"TerraFM encoder: last {n}/{len(blocks)} blocks unfrozen (Stage 1)"
-                )
-            # Also unfreeze the (now-inflated) patch embedding so S1 weights train
-            conv = self._find_patch_embed_conv(self.backbone)
-            if conv is not None:
-                for p in conv.parameters():
+            blocks = self.backbone.blocks
+            n = CFG.unfreeze_last_n_blocks
+            for blk in blocks[-n:]:
+                for p in blk.parameters():
                     p.requires_grad = True
-            # Unfreeze final LayerNorms
-            for name, m in self.backbone.named_modules():
-                if isinstance(m, nn.LayerNorm) and "norm" in name.lower():
-                    for p in m.parameters():
-                        p.requires_grad = True
+            # Unfreeze patch embed so S1/S2 conv weights can adapt
+            for p in self.backbone.patch_embed.parameters():
+                p.requires_grad = True
+            # Unfreeze final norm
+            for p in self.backbone.norm.parameters():
+                p.requires_grad = True
+            logger.info(f"TerraFM: last {n}/{len(blocks)} blocks + patch_embed unfrozen (Stage 1)")
 
         elif stage == 2:
             for p in self.backbone.parameters():
                 p.requires_grad = True
-            logger.info("TerraFM encoder: ALL unfrozen (Stage 2)")
+            logger.info("TerraFM: ALL unfrozen (Stage 2)")
 
-        trainable = sum(
-            p.numel() for p in self.backbone.parameters() if p.requires_grad
-        )
+        trainable = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
         logger.info(f"  Trainable encoder params: {trainable/1e6:.1f}M")
 
     # ------------------------------------------------------------------
@@ -542,63 +223,103 @@ class TerraFMEncoder(nn.Module):
 
     def forward(self, fused: torch.Tensor) -> List[torch.Tensor]:
         """
-        Extract multi-scale spatial features from TerraFM.
+        Extract multi-scale spatial features.
 
         Args:
-            fused: [B, 14, 224, 224]  (S2 channels first, then S1)
+            fused: [B, 14, H, W]  — channels 0:12 = S2 L2A, channels 12:14 = S1
+
+        Strategy (derived from terrafm.py PatchEmbed.forward logic):
+            1. Split fused → s2 [B,12,H,W] and s1 [B,2,H,W]
+            2. Embed S2 via patch_embed(s2, is_l2a=True) → [B, N, embed_dim]
+               (goes through conv2d_s2_l2a → TokenProjection → 768-dim)
+            3. Embed S1 via patch_embed(s1) → [B, N, 2304-dim]
+               S1 does NOT go through TokenProjection in the original code.
+               We add a learned linear to project S1 tokens to embed_dim.
+            4. Sum S2 and S1 token embeddings → [B, N, embed_dim]
+            5. Add CLS token + positional encoding
+            6. Run transformer blocks
+            7. Return intermediate block outputs reshaped to [B, C, 14, 14]
 
         Returns:
-            List of 4 tensors, each [B, embed_dim, 14, 14].
-            Ordered from shallow → deep transformer blocks.
-            embed_dim = 768 for ViT-B (confirmed from checkpoint).
-
-        SPATIAL NOTE:
-            224×224 / 16 patch = 14×14 grid = 196 tokens.
-            Each token covers ~16 px × 10 m/px = 160 m of ground.
-            The decoder upsamples back to 224×224.
+            List of 4 tensors, each [B, 768, 14, 14].
         """
-        B = fused.shape[0]
+        B, C, H, W = fused.shape
+        assert C == 14, f"Expected 14 channels, got {C}"
 
-        if self._use_timm_api:
-            raw = self.backbone.get_intermediate_layers(
-                fused,
-                n=self.feature_indices,
-                reshape=False,
-                return_prefix_tokens=False,
-            )
-            features = list(raw)
-        else:
-            self._hook_outputs = [None] * len(self.feature_indices)
-            _ = self.backbone(fused)
-            features = []
-            for i, feat in enumerate(self._hook_outputs):
-                if feat is None:
-                    features.append(
-                        torch.zeros(
-                            B,
-                            self.num_patches_side ** 2,
-                            self.embed_dim,
-                            device=fused.device,
-                            dtype=fused.dtype,
-                        )
-                    )
-                else:
-                    features.append(feat)
+        s2 = fused[:, :12, :, :]   # S2 L2A channels
+        s1 = fused[:, 12:, :, :]   # S1 VV+VH channels
 
+        # --- S2 embedding: [B, N, 2304] → TokenProjection → [B, N, 768] ---
+        x_s2 = self.backbone.patch_embed(s2, is_l2a=True)   # [B, N, embed_dim]
+
+        # --- S1 embedding: [B, 2, H, W] → conv2d_s1 → [B, N, 2304] ---
+        # The original forward returns 2304-dim for S1 (no projection).
+        # We project it to embed_dim using a dedicated linear layer.
+        x_s1_raw = self._embed_s1(s1)   # [B, N, embed_dim]
+
+        # --- Fuse: sum the two modality embeddings ---
+        x = x_s2 + x_s1_raw   # [B, N, embed_dim]
+
+        # --- Add CLS token and positional encoding (from backbone) ---
+        cls_tokens = self.backbone.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.backbone.interpolate_pos_encoding(x, W, H)
+        x = self.backbone.pos_drop(x)
+
+        # --- Run transformer blocks, collecting intermediate outputs ---
+        # feature_indices are 0-indexed block positions (e.g. [2, 5, 8, 11])
+        target_set = set(self.feature_indices)
+        collected  = {}
+
+        for i, blk in enumerate(self.backbone.blocks):
+            x = blk(x)
+            if i in target_set:
+                collected[i] = x
+
+        # Normalize the last collected output only
+        # (applying norm to all is optional; we normalize the final one)
+        last_idx = max(self.feature_indices)
+        if last_idx in collected:
+            collected[last_idx] = self.backbone.norm(collected[last_idx])
+
+        # Return in order of feature_indices
+        features = [collected[i] for i in self.feature_indices]
         return [self._to_spatial(f, B) for f in features]
 
+    def _embed_s1(self, s1: torch.Tensor) -> torch.Tensor:
+        """
+        Embed S1 tokens using conv2d_s1, then project to embed_dim.
+
+        The official PatchEmbed.forward() for S1 returns 2304-dim tokens
+        (attn_dim = embed_dim * 3) without calling TokenProjection.
+        We project to embed_dim using a lazily-created linear layer so
+        the first call initialises it to the correct size.
+        """
+        # conv2d_s1: [B, 2, H, W] → [B, attn_dim, H/p, W/p] → [B, N, attn_dim]
+        pe = self.backbone.patch_embed
+        x  = pe.conv2d_s1(s1).flatten(2).transpose(1, 2)   # [B, N, 2304]
+        x  = x + pe.s1_embed                                 # add modality embed
+
+        # Project 2304 → embed_dim (768) using the TokenProjection already
+        # present in the patch embed (it was designed for this purpose)
+        x = pe.projection(x)   # [B, N, embed_dim]
+        return x
+
     def _to_spatial(self, tokens: torch.Tensor, B: int) -> torch.Tensor:
-        """Reshape [B, N, C] (or [B, N+1, C] with CLS token) → [B, C, H, W]."""
+        """
+        Reshape block output [B, N+1, C] → spatial map [B, C, H, W].
+        Strips the CLS token (position 0).
+        """
         if tokens.dim() == 2:
             tokens = tokens.unsqueeze(0)
-        N = tokens.shape[1]
-        exp = self.num_patches_side ** 2   # 196
-        if N == exp + 1:
-            tokens = tokens[:, 1:, :]      # strip CLS token
-        elif N != exp:
-            logger.warning(f"Token count {N} ≠ {exp}; truncating.")
-            tokens = tokens[:, :exp, :]
-        feat = tokens.permute(0, 2, 1).reshape(
+        # Strip CLS token
+        patch_tokens = tokens[:, 1:, :]   # [B, N, C]
+        N = patch_tokens.shape[1]
+        expected = self.num_patches_side ** 2   # 196
+        if N != expected:
+            logger.warning(f"Token count {N} ≠ {expected}; taking first {expected}.")
+            patch_tokens = patch_tokens[:, :expected, :]
+        feat = patch_tokens.permute(0, 2, 1).reshape(
             B, self.embed_dim, self.num_patches_side, self.num_patches_side
         )
         return feat.contiguous()
